@@ -1,9 +1,15 @@
 name: keoni
 # Stack Keoni IA production.
-# Docker construit l'image matching-api localement depuis ./services/matching-api/.
+# L'image matching-api est buildée par la CI (.github/workflows/ci.yml) et
+# poussée sur GHCR -- ce compose ne fait que la tirer (MATCHING_API_IMAGE /
+# IMAGE_TAG passés en environnement au moment du déploiement, voir le job
+# "deploy" de la CI). Ne plus builder localement sur le serveur de prod.
 #
-# Usage :
-#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+# Déploiement (fait par la CI, ou à la main en dépannage) :
+#   export MATCHING_API_IMAGE=ghcr.io/99ch/keoni-matching-api
+#   export IMAGE_TAG=sha-<commit>   # ou "latest"
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml pull matching-api
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
 #
 # Tous les ports sont bindés uniquement sur 127.0.0.1 (loopback), jamais exposés publiquement.
 services:
@@ -44,10 +50,7 @@ services:
     networks:
       - keoni_net
   matching-api:
-    build:
-      context: ./services/matching-api
-      dockerfile: Dockerfile
-    image: keoni-matching-api:local
+    image: ${MATCHING_API_IMAGE}:${IMAGE_TAG}
     container_name: keoni_matching_api_prod
     restart: unless-stopped
     env_file: .env.prod
