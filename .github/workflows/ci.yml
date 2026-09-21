@@ -43,7 +43,10 @@ jobs:
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
       - name: Run pytest
-        run: pytest tests -q
+        # python -m pytest (pas le seul exécutable pytest) : ajoute le
+        # répertoire courant à sys.path, nécessaire pour que `from app import
+        # ...` résolve sans installer le package ni ajouter de conftest.py.
+        run: python -m pytest tests -q
 
   build-and-push:
     needs: test
