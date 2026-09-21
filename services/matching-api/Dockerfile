@@ -23,6 +23,8 @@ ENV PIP_DEFAULT_TIMEOUT=600
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY alembic ./alembic
+COPY alembic.ini ./
 
 EXPOSE 8000
 

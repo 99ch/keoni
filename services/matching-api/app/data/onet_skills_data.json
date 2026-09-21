@@ -1,0 +1,344 @@
+{
+ ".NET Framework": [
+  ".net framework",
+  "dot net framework",
+  "microsoft net framework"
+ ],
+ "ASP": [
+  "active server pages",
+  "asp",
+  "microsoft active server pages asp"
+ ],
+ "ASP.NET": [
+  "microsoft asp net"
+ ],
+ "AWS": [
+  "amazon web services aws software"
+ ],
+ "AWS CloudFormation": [
+  "amazon web services aws cloudformation",
+  "aws cloudformation",
+  "cloudformation"
+ ],
+ "Adobe Acrobat": [
+  "adobe acrobat"
+ ],
+ "Adobe After Effects": [
+  "adobe after effects"
+ ],
+ "Adobe Creative Cloud": [
+  "adobe creative cloud software"
+ ],
+ "Alteryx": [
+  "alteryx",
+  "alteryx software"
+ ],
+ "Amazon DynamoDB": [
+  "amazon dynamodb",
+  "dynamodb"
+ ],
+ "Amazon EC2": [
+  "amazon ec2",
+  "amazon elastic compute cloud ec2",
+  "ec2"
+ ],
+ "Amazon Redshift": [
+  "amazon redshift",
+  "redshift"
+ ],
+ "Ansible": [
+  "ansible software"
+ ],
+ "Apache Airflow": [
+  "airflow",
+  "apache airflow"
+ ],
+ "Apache Cassandra": [
+  "apache cassandra",
+  "cassandra"
+ ],
+ "Apache Hadoop": [
+  "apache hadoop"
+ ],
+ "Apache Hive": [
+  "apache hive",
+  "hive"
+ ],
+ "Apache Spark": [
+  "apache spark"
+ ],
+ "Apache Subversion": [
+  "apache subversion svn"
+ ],
+ "Apple Safari": [
+  "apple safari",
+  "safari"
+ ],
+ "Apple macOS": [
+  "apple macos",
+  "mac os",
+  "macos"
+ ],
+ "ArcGIS": [
+  "arcgis",
+  "esri arcgis",
+  "esri arcgis software"
+ ],
+ "Asana": [
+  "asana"
+ ],
+ "AutoCAD": [
+  "autodesk autocad"
+ ],
+ "AutoCAD Civil 3D": [
+  "autocad civil 3d",
+  "autodesk autocad civil 3d"
+ ],
+ "Autodesk Revit": [
+  "autodesk revit"
+ ],
+ "BGP": [
+  "bgp",
+  "border gateway protocol",
+  "border gateway protocol bgp"
+ ],
+ "Bentley MicroStation": [
+  "bentley microstation",
+  "microstation"
+ ],
+ "Bitbucket": [
+  "atlassian bitbucket"
+ ],
+ "CSS": [
+  "cascading style sheets",
+  "cascading style sheets css"
+ ],
+ "Cisco Webex": [
+  "cisco webex",
+  "webex"
+ ],
+ "Confluence": [
+  "atlassian confluence"
+ ],
+ "Eclipse IDE": [
+  "eclipse ide"
+ ],
+ "Google Android": [
+  "android",
+  "google android"
+ ],
+ "Google Angular": [
+  "google angular"
+ ],
+ "Google Docs": [
+  "google docs"
+ ],
+ "Google Looker": [
+  "google looker",
+  "google looker analytics",
+  "looker"
+ ],
+ "Google Workspace": [
+  "google workspace",
+  "google workspace software"
+ ],
+ "Grafana": [
+  "grafana labs grafana cloud"
+ ],
+ "HTML": [
+  "hypertext markup language",
+  "hypertext markup language html"
+ ],
+ "Hibernate ORM": [
+  "hibernate",
+  "hibernate orm"
+ ],
+ "HubSpot": [
+  "hubspot software"
+ ],
+ "IBM SPSS Statistics": [
+  "ibm spss statistics",
+  "spss"
+ ],
+ "IBM WebSphere MQ": [
+  "ibm websphere mq",
+  "websphere mq"
+ ],
+ "Informatica": [
+  "informatica software"
+ ],
+ "Intuit QuickBooks": [
+  "intuit quickbooks",
+  "quickbooks"
+ ],
+ "J2EE": [
+  "java 2 enterprise edition",
+  "oracle java 2 platform enterprise edition j2ee"
+ ],
+ "JSON": [
+  "javascript object notation",
+  "javascript object notation json"
+ ],
+ "Jenkins": [
+  "jenkins ci"
+ ],
+ "Jira": [
+  "atlassian jira"
+ ],
+ "MATLAB": [
+  "the mathworks matlab"
+ ],
+ "Marketo": [
+  "marketo",
+  "marketo marketing automation"
+ ],
+ "Microsoft Azure": [
+  "microsoft azure software"
+ ],
+ "Microsoft Edge": [
+  "edge browser",
+  "microsoft edge"
+ ],
+ "Microsoft Outlook": [
+  "microsoft outlook",
+  "outlook"
+ ],
+ "Microsoft Teams": [
+  "microsoft teams"
+ ],
+ "Mozilla Firefox": [
+  "firefox",
+  "mozilla firefox"
+ ],
+ "OpenShift": [
+  "openshift",
+  "red hat openshift"
+ ],
+ "Oracle Cloud": [
+  "oracle cloud",
+  "oracle cloud software"
+ ],
+ "Oracle SQL Developer": [
+  "oracle sql developer"
+ ],
+ "PL/SQL": [
+  "oracle pl sql"
+ ],
+ "PeopleSoft": [
+  "oracle peoplesoft",
+  "peoplesoft"
+ ],
+ "Power Automate": [
+  "microsoft power automate",
+  "power automate"
+ ],
+ "Power BI": [
+  "microsoft power bi"
+ ],
+ "Power Platform": [
+  "microsoft power platform software",
+  "power platform"
+ ],
+ "PowerPoint": [
+  "microsoft powerpoint"
+ ],
+ "PowerShell": [
+  "microsoft powershell",
+  "powershell"
+ ],
+ "Primavera": [
+  "oracle primavera enterprise project portfolio management",
+  "primavera",
+  "primavera p6"
+ ],
+ "Procore": [
+  "procore",
+  "procore software"
+ ],
+ "Puppet": [
+  "puppet",
+  "puppet software"
+ ],
+ "PyTorch": [
+  "pytorch"
+ ],
+ "Red Hat Enterprise Linux": [
+  "red hat enterprise linux",
+  "rhel"
+ ],
+ "SAP Concur": [
+  "concur",
+  "sap concur"
+ ],
+ "SQL": [
+  "structured query language sql"
+ ],
+ "SQL Server": [
+  "microsoft sql server"
+ ],
+ "SSIS": [
+  "microsoft sql server integration services ssis"
+ ],
+ "SSRS": [
+  "microsoft sql server reporting services ssrs"
+ ],
+ "Salesforce": [
+  "salesforce software"
+ ],
+ "SharePoint": [
+  "microsoft sharepoint"
+ ],
+ "Shell script": [
+  "shell script"
+ ],
+ "SketchUp": [
+  "sketchup",
+  "trimble sketchup pro"
+ ],
+ "Slack": [
+  "slack"
+ ],
+ "SolidWorks": [
+  "dassault systemes solidworks"
+ ],
+ "Splunk": [
+  "splunk",
+  "splunk enterprise"
+ ],
+ "Spring Framework": [
+  "spring framework"
+ ],
+ "Team Foundation Server": [
+  "microsoft team foundation server"
+ ],
+ "TensorFlow": [
+  "tensorflow"
+ ],
+ "Terraform": [
+  "ibm terraform"
+ ],
+ "Transact-SQL": [
+  "t sql",
+  "transact-sql"
+ ],
+ "UNIX Shell": [
+  "unix shell",
+  "unix shell scripting"
+ ],
+ "VBA": [
+  "microsoft visual basic for applications vba"
+ ],
+ "Visual Basic": [
+  "microsoft visual basic"
+ ],
+ "Windows Server": [
+  "microsoft windows server",
+  "windows server"
+ ],
+ "Workday": [
+  "workday software"
+ ],
+ "Zoom": [
+  "zoom"
+ ]
+}
