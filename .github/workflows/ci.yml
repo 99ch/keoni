@@ -119,6 +119,14 @@ jobs:
           script: |
             set -euo pipefail
             cd "${{ secrets.DEPLOY_PATH }}"
+            # Le serveur est un checkout git de ce repo : on le resynchronise
+            # sur main avant de relancer, sinon docker-compose.prod.yml et
+            # ops/ restent figes sur l'etat importe au premier commit.
+            # --ff-only echoue proprement (au lieu d'ecraser) si le checkout
+            # local a divergé -- .env.prod et volumes/ sont gitignores, donc
+            # jamais concernes par ce pull.
+            git fetch origin main
+            git merge --ff-only origin/main
             test -f .env.prod
             export IMAGE_TAG="$IMAGE_TAG"
             export MATCHING_API_IMAGE="$MATCHING_API_IMAGE"
