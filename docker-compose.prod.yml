@@ -1,0 +1,138 @@
+name: keoni
+# Stack Keoni IA production.
+# Docker construit l'image matching-api localement depuis ./services/matching-api/.
+#
+# Usage :
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# Tous les ports sont bindés uniquement sur 127.0.0.1 (loopback), jamais exposés publiquement.
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: keoni_db_prod
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./volumes/prod/db:/var/lib/postgresql/data
+    mem_limit: 256m
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - keoni_net
+  matching-api:
+    build:
+      context: ./services/matching-api
+      dockerfile: Dockerfile
+    image: keoni-matching-api:local
+    container_name: keoni_matching_api_prod
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      MATCHING_API_KEY: ${MATCHING_API_KEY}
+      MODEL_CACHE: /models
+      DATA_DIR: /data/cv_raw
+      MATCHING_PRELOAD_MODEL: ${MATCHING_PRELOAD_MODEL:-1}
+      MATCHING_MIN_TITLE_HITS: ${MATCHING_MIN_TITLE_HITS:-3}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      TZ: ${TIMEZONE}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./volumes/models:/models
+      - ./volumes/data/cv_raw:/data/cv_raw
+    mem_limit: 1536m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - keoni_net
+  n8n:
+    image: n8nio/n8n:1.123.10
+    container_name: keoni_n8n_prod
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      GENERIC_TIMEZONE: ${TIMEZONE}
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_RUNNERS_TASK_TIMEOUT: 900
+      N8N_SECURE_COOKIE: "true"
+      N8N_PROXY_HOPS: 0
+      N8N_HOST: 127.0.0.1
+      N8N_LISTEN_ADDRESS: 0.0.0.0
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+      WP_API_BASE_URL: ${WP_API_BASE_URL}
+      MATCHING_API_BASE_URL: ${MATCHING_API_BASE_URL}
+      WP_API_KEY: ${WP_API_KEY}
+      MATCHING_API_KEY: ${MATCHING_API_KEY}
+    depends_on:
+      - db
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - ./volumes/prod/n8n:/home/node/.n8n
+    mem_limit: 768m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - keoni_net
+networks:
+  keoni_net:
+    driver: bridge
+    name: keoni_prod_net
