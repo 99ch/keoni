@@ -218,6 +218,11 @@ class ScoreResponse(BaseModel):
     results: List[ScoreItem]
 
 
+class ExtractResponse(BaseModel):
+    text: str
+    skills: List[str]
+
+
 class SkillEmbeddingTuningRead(BaseModel):
     threshold: float
     max_credit: float
@@ -1077,6 +1082,29 @@ def update_skill_embedding_tuning_endpoint(
         settings.skill_embedding_threshold, settings.skill_embedding_max_credit
     )
     return SkillEmbeddingTuningRead(threshold=threshold, max_credit=max_credit, is_overridden=overridden)
+
+
+@app.post("/extract/cv", response_model=ExtractResponse)
+def extract_cv(cv: CvPayload, _: None = Depends(require_api_key)) -> ExtractResponse:
+    """Texte assemblé + compétences détectées pour un CV seul, hors scoring.
+
+    Réutilise prepare_cv() (extraction fichier + taxonomie) telles quelles --
+    aucun appel modèle (embeddings/cross-encoder), donc rapide et synchrone.
+    Alimente le bouton "Vue structurée" côté WordPress.
+    """
+    prepared = prepare_cv(cv)
+    if not prepared.text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour ce CV")
+    return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
+
+
+@app.post("/extract/job", response_model=ExtractResponse)
+def extract_job(job: JobPayload, _: None = Depends(require_api_key)) -> ExtractResponse:
+    """Équivalent de /extract/cv côté offre (prepare_job() seul, sans scoring)."""
+    prepared = prepare_job(job)
+    if not prepared.text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
+    return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
 
 
 @app.post("/score", response_model=ScoreResponse)
