@@ -491,3 +491,11 @@ def test_strip_html_collapses_adjacent_tags_to_a_single_space():
 def test_strip_html_passes_through_plain_text_and_empty_string():
     assert strip_html("Python, Django") == "Python, Django"
     assert strip_html("") == ""
+
+
+def test_strip_html_removes_double_escaped_tags_from_paste_artifacts():
+    # Un artefact de collage peut ré-échapper une fois de plus des balises
+    # déjà stockées telles quelles -- observé en production sur un champ
+    # "environnement technique" d'une offre réelle.
+    raw = "KoboToolbox. &lt;strong data-start=\"2743\" data-end=\"2772\"&gt;environnement technique :&lt;/strong&gt; python"
+    assert normalize_whitespace(strip_html(raw)) == "KoboToolbox. environnement technique : python"

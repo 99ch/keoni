@@ -100,10 +100,14 @@ def strip_html(value: str) -> str:
     Les champs offre/CV proviennent de champs WYSIWYG WordPress et peuvent
     contenir du balisage brut (voire des artefacts de copier-coller, ex.
     des spans de sélection) qu'un texte destiné à l'extraction/l'embedding
-    ne doit pas exposer tel quel."""
+    ne doit pas exposer tel quel. On décode les entités *avant* de retirer
+    les balises : un artefact de collage peut arriver ré-échappé une fois
+    de plus par l'éditeur WYSIWYG (`&lt;strong&gt;...&lt;/strong&gt;`) --
+    tant qu'il n'est pas décodé, ce n'est pas encore une vraie balise et
+    le retrait par regex ne le voit pas."""
     if not value:
         return value
-    return html.unescape(_HTML_TAG_RE.sub(" ", value))
+    return _HTML_TAG_RE.sub(" ", html.unescape(value))
 
 
 def fold_text(value: str) -> str:
