@@ -42,6 +42,7 @@ Composantes AI Real-Time désormais toutes portées :
 """
 from __future__ import annotations
 
+import html
 import re
 import threading
 import unicodedata
@@ -88,6 +89,21 @@ SemanticCreditFn = Callable[[FrozenSet[str], FrozenSet[str]], float]
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html(value: str) -> str:
+    """Retire les balises HTML et décode les entités (&amp;, &nbsp;...).
+
+    Les champs offre/CV proviennent de champs WYSIWYG WordPress et peuvent
+    contenir du balisage brut (voire des artefacts de copier-coller, ex.
+    des spans de sélection) qu'un texte destiné à l'extraction/l'embedding
+    ne doit pas exposer tel quel."""
+    if not value:
+        return value
+    return html.unescape(_HTML_TAG_RE.sub(" ", value))
 
 
 def fold_text(value: str) -> str:

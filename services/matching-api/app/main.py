@@ -40,6 +40,7 @@ from app.scoring import (
     get_skill_embedding_tuning,
     normalize_whitespace,
     overlap_text,
+    strip_html,
     set_skill_embedding_tuning,
     split_priority_keyword_terms,
     tokenize,
@@ -413,16 +414,18 @@ def text_from_file(path: Path) -> str:
 
 
 def assemble_cv_text(cv: CvPayload) -> str:
+    # text_content/resume peuvent venir d'un champ WYSIWYG WordPress et
+    # contenir du balisage HTML brut -- même nettoyage que côté offre.
     parts: List[str] = []
     for value in [cv.text_content, cv.resume, cv.skills]:
         if value:
-            parts.append(value)
+            parts.append(strip_html(value))
 
     meta = cv.metadata or {}
     for key in ("summary", "experience", "notes", "resume"):
         value = meta.get(key)
         if isinstance(value, str):
-            parts.append(value)
+            parts.append(strip_html(value))
 
     combined = normalize_whitespace(" ".join(parts))
     if combined:
@@ -447,19 +450,25 @@ def assemble_cv_text(cv: CvPayload) -> str:
 
 def prepare_job(job: JobPayload) -> PreparedJob:
     meta = job.meta or {}
+    # description/content/excerpt viennent d'un champ WYSIWYG WordPress et
+    # peuvent contenir du balisage HTML brut (voire des artefacts de
+    # copier-coller) -- à nettoyer avant de servir de texte matching/embedding.
+    description = strip_html(job.description) if job.description else job.description
+    content = strip_html(job.content) if job.content else job.content
+    excerpt = strip_html(job.excerpt) if job.excerpt else job.excerpt
     keywords = parse_keywords(job.keywords) + parse_keywords(meta.get("skills"))
     keywords = list(dict.fromkeys(keywords))
-    text_parts = [job.title, job.description, job.content, job.excerpt, " ".join(keywords), meta.get("experience", "")]
+    text_parts = [job.title, description, content, excerpt, " ".join(keywords), meta.get("experience", "")]
     text = normalize_whitespace(" ".join(filter(None, text_parts)))
     # Texte dédié au cross-encoder, en langage naturel uniquement : lui coller
     # la liste de mots-clés bruts (utile pour l'embedding, tolérant au
     # sac-de-mots) a fait chuter un score cross-encoder de 0.56 à 0.005 sur un
     # cas réel — le cross-encoder juge la cohérence de la phrase, pas juste
     # la présence de mots. Repli sur `text` si les champs naturels sont vides.
-    semantic_parts = [job.title, job.description, job.content, job.excerpt]
+    semantic_parts = [job.title, description, content, excerpt]
     semantic_text = normalize_whitespace(" ".join(filter(None, semantic_parts))) or text
     location = (job.location or meta.get("location") or "").lower()
-    tokens = tokenize(f"{job.title} {job.description}")
+    tokens = tokenize(f"{job.title} {description}")
     category = normalized_text(find_first(meta, ["jobcategory_text", "category_text", "job_category", "category"]))
     jobtype = normalized_text(find_first(meta, ["jobtype_text", "job_type", "type", "jobtype"]))
     min_experience_years = parse_float(find_first(meta, ["experience", "min_experience", "required_experience"]))

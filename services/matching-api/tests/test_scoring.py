@@ -22,6 +22,7 @@ from app.scoring import (  # noqa: E402
     jobtype_component,
     location_component,
     normalize_priority_keyword,
+    normalize_whitespace,
     priority_keyword_component,
     qualification_component,
     resolve_priority_keywords,
@@ -29,6 +30,7 @@ from app.scoring import (  # noqa: E402
     set_skill_embedding_tuning,
     skills_component,
     split_priority_keyword_terms,
+    strip_html,
     weights_for_profile,
 )
 
@@ -474,3 +476,18 @@ def test_set_skill_embedding_tuning_accumulates_across_calls():
     set_skill_embedding_tuning(threshold=None, max_credit=0.9)
     threshold, max_credit, overridden = get_skill_embedding_tuning(0.6, 0.8)
     assert (threshold, max_credit, overridden) == (0.4, 0.9, True)
+
+
+def test_strip_html_removes_tags_and_decodes_entities():
+    raw = '<p class="PDq2pG_selectionAnchorContainer" data-start="42">Développeur &amp; DevOps</p>'
+    assert normalize_whitespace(strip_html(raw)) == "Développeur & DevOps"
+
+
+def test_strip_html_collapses_adjacent_tags_to_a_single_space():
+    raw = "<div><strong>Python</strong>, <em>Django</em></div>"
+    assert normalize_whitespace(strip_html(raw)) == "Python , Django"
+
+
+def test_strip_html_passes_through_plain_text_and_empty_string():
+    assert strip_html("Python, Django") == "Python, Django"
+    assert strip_html("") == ""
