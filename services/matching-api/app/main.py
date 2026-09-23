@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -110,6 +111,12 @@ class Settings:
     wp_api_base_url: str = os.getenv("WP_API_BASE_URL", "https://keoni-consulting.net").rstrip("/")
     wp_api_key: str = os.getenv("WP_API_KEY", "")
     reindex_page_size: int = int(os.getenv("MATCHING_REINDEX_PAGE_SIZE", "100"))
+    # Téléchargement + extraction Tika/PyMuPDF mesurés à ~1.1s/CV en série
+    # sur l'échantillon de validation (50 CV, 2026-09-23) -- entièrement de
+    # l'attente réseau (fichier WordPress + serveur Tika local), donc
+    # parallélisable sans contention CPU. ~10-11h en série sur ~33k CV
+    # ramenées à quelques heures avec ce pool.
+    reindex_download_workers: int = int(os.getenv("MATCHING_REINDEX_DOWNLOAD_WORKERS", "8"))
     retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
     retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
     # `lists = 100` sur l'index ivfflat (voir app/models.py) -- fixer les
@@ -730,21 +737,30 @@ def reindex_cv_text(resume: dict) -> str:
 def reindex_cv_batch(resumes: List[dict]) -> None:
     """Embed + upsert dans cv_embeddings les CV d'une page dont le texte a
     changé (gated par content_hash, comme /score) -- idempotent, une
-    réindexation relancée ne retraite que ce qui a bougé."""
+    réindexation relancée ne retraite que ce qui a bougé.
+
+    Le téléchargement + extraction (reindex_cv_text) est parallélisé sur un
+    pool de threads : c'est entièrement de l'attente réseau (fichier
+    WordPress, serveur Tika local), mesuré à ~1.1s/CV en série sur
+    l'échantillon de validation -- sans ça, ~33k CV auraient pris ~10-11h.
+    Étape séparée de la transaction DB qui suit : SQLAlchemy/psycopg ne sont
+    pas conçus pour un partage naïf de connexion entre threads.
+    """
     engine = get_engine()
     if engine is None:
         raise RuntimeError("Base de données indisponible, réindexation impossible")
 
-    to_embed: List[Tuple[int, str]] = []
-
-    with engine.begin() as conn:
-        for resume in resumes:
-            cv_id = int(resume.get("id") or 0)
-            if cv_id <= 0:
-                continue
-
+    texts: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=settings.reindex_download_workers) as executor:
+        future_to_cv_id = {
+            executor.submit(reindex_cv_text, resume): int(resume.get("id") or 0)
+            for resume in resumes
+            if int(resume.get("id") or 0) > 0
+        }
+        for future in as_completed(future_to_cv_id):
+            cv_id = future_to_cv_id[future]
             try:
-                text_value = reindex_cv_text(resume)
+                text_value = future.result()
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Réindexation CV %s: extraction échouée: %s", cv_id, exc)
                 _reindex_status["errors"] += 1
@@ -754,6 +770,15 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                 _reindex_status["skipped"] += 1
                 continue
 
+            texts[cv_id] = text_value
+
+    if not texts:
+        return
+
+    to_embed: List[Tuple[int, str]] = []
+
+    with engine.begin() as conn:
+        for cv_id, text_value in texts.items():
             new_hash = content_hash(text_value)
             existing = conn.execute(
                 select(CvEmbedding.content_hash).where(CvEmbedding.cv_id == cv_id)
