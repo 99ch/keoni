@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 # Configuration OCR, indépendante de app.main.Settings pour éviter tout
 # import circulaire (ce module est importé depuis main.py).
 OCR_MIN_TEXT_LENGTH = int(os.getenv("MATCHING_OCR_MIN_TEXT_LENGTH", "20"))
-OCR_DPI = int(os.getenv("MATCHING_OCR_DPI", "200"))
+# 150 plutôt que 200 : rendu pdftoppm + Tesseract sur ~44% de pixels en
+# moins (150²/200²), sans perte notable de lisibilité pour du texte de CV
+# (mesuré comme le vrai goulot CPU du réindex complet, VPS à 4 vCPU
+# partagé avec d'autres stacks -- voir reindex_download_workers ci-dessous).
+OCR_DPI = int(os.getenv("MATCHING_OCR_DPI", "150"))
 OCR_LANGUAGES = os.getenv("MATCHING_OCR_LANGUAGES", "fra+eng")
 OCR_OEM = int(os.getenv("MATCHING_OCR_OEM", "3"))
 OCR_MAX_PAGES = int(os.getenv("MATCHING_OCR_MAX_PAGES", "20"))
