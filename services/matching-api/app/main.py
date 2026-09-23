@@ -1241,6 +1241,44 @@ def active_weights(profile: Optional[str] = None) -> dict[str, float]:
     return weights_for_profile(profile, base=base_weights())
 
 
+def representative_excerpts(text: str, terms: List[str], max_items: int, window: int = 70) -> List[str]:
+    """Courts fragments du texte source autour de chaque terme trouvé --
+    porte le principe des "Extraits représentatifs" d'AI Real-Time, sans
+    algorithme équivalent documenté côté eux à reproduire à l'identique.
+
+    job.text/cv.text sont normalisés sur une seule ligne par
+    normalize_whitespace() (voir prepare_job()/assemble_cv_text()) : la mise
+    en forme d'origine (puces, retours à la ligne du CV/de l'offre) n'existe
+    déjà plus à ce stade, donc pas de découpage par ligne source possible --
+    fenêtre de caractères autour de la 1re occurrence de chaque terme à la
+    place, ce qui donne des fragments plus courts que les lignes complètes
+    de leur exemple.
+    """
+    if not text or not terms:
+        return []
+    lower_text = text.lower()
+    excerpts: List[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        idx = lower_text.find(term.lower())
+        if idx == -1:
+            continue
+        start = max(0, idx - window // 2)
+        end = min(len(text), idx + len(term) + window // 2)
+        snippet = text[start:end].strip()
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(text):
+            snippet += "…"
+        if snippet in seen:
+            continue
+        seen.add(snippet)
+        excerpts.append(snippet)
+        if len(excerpts) >= max_items:
+            break
+    return excerpts
+
+
 def build_score(
     job: PreparedJob, cv: PreparedCv, similarity: float, rank: int, rerank_score: Optional[float] = None
 ) -> ScoreItem:
@@ -1283,6 +1321,15 @@ def build_score(
             weaknesses.append("Aucune compétence requise reconnue en commun.")
         if result.skills_missing:
             weaknesses.append(f"Compétences manquantes côté offre : {', '.join(result.skills_missing)}.")
+
+    # Compétences matchées qui sont AUSSI dans les mots-clés prioritaires du
+    # recruteur (les deux composantes tapent sur des listes "requises"
+    # différentes -- skills_canonical vs keyword_terms_raw -- donc
+    # l'intersection identifie ce qui compte double). Reflète la 3e ligne
+    # de "Pourquoi ce match" chez AI Real-Time.
+    complementary_skills = sorted(set(result.skill_hits) & set(result.keyword_hits))
+    if complementary_skills:
+        strengths.append(f"Compétences complémentaires détectées : {', '.join(complementary_skills)}.")
 
     title_overlap = job.tokens.intersection(cv.title_tokens)
     if title_overlap:
@@ -1349,6 +1396,15 @@ def build_score(
     if result.keyword_hits:
         summary += f" Mots-clés principaux : {', '.join(result.keyword_hits[:8])}."
 
+    # "Extraits représentatifs" : fragments du CV/de l'offre contenant les
+    # termes trouvés (compétences + mots-clés confondus, dédupliqués) --
+    # voir representative_excerpts() pour la limite documentée (texte
+    # normalisé sur une seule ligne, donc fenêtre de caractères plutôt que
+    # ligne d'origine).
+    matched_terms = list(dict.fromkeys(result.skill_hits + result.keyword_hits))
+    excerpts_cv = representative_excerpts(cv.text, matched_terms, max_items=6)
+    excerpts_job = representative_excerpts(job.text, matched_terms, max_items=4)
+
     extra = {
         "summary": summary,
         "vector_similarity": round(float(similarity), 4),
@@ -1358,6 +1414,8 @@ def build_score(
         "keyword_missing": result.keyword_missing,
         "skill_hits": result.skill_hits,
         "skills_missing": result.skills_missing,
+        "excerpts_cv": excerpts_cv,
+        "excerpts_job": excerpts_job,
         "scoring_profile": job.scoring_profile,
         "rank": rank + 1,
         "cv_category": cv.category,
