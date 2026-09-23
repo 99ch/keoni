@@ -20,7 +20,7 @@ import faiss
 import numpy as np
 import pytesseract
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -99,6 +99,23 @@ class Settings:
     )
     skill_embedding_threshold: float = float(os.getenv("MATCHING_SKILL_EMBEDDING_THRESHOLD", "0.6"))
     skill_embedding_max_credit: float = float(os.getenv("MATCHING_SKILL_EMBEDDING_MAX_CREDIT", "0.8"))
+    # Réindexation/récupération sur l'ensemble du vivier de CV (voir
+    # /admin/reindex-cvs et /retrieve) -- mêmes identifiants que ceux déjà
+    # utilisés par n8n pour appeler keoni-bridge, partagés via .env.prod.
+    # n8n appelle keoni-bridge avec cette URL en dur (voir Fetch CV L1/L2/L3
+    # dans le workflow), WP_API_BASE_URL n'y est pas référencé -- on garde le
+    # même défaut connu-fonctionnel plutôt que de dépendre d'une variable
+    # d'env dont le format exact n'est pas garanti, tout en la laissant
+    # surchargeable.
+    wp_api_base_url: str = os.getenv("WP_API_BASE_URL", "https://keoni-consulting.net/wp-json/keoni/v1").rstrip("/")
+    wp_api_key: str = os.getenv("WP_API_KEY", "")
+    reindex_page_size: int = int(os.getenv("MATCHING_REINDEX_PAGE_SIZE", "100"))
+    retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
+    retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
+    # `lists = 100` sur l'index ivfflat (voir app/models.py) -- fixer les
+    # probes au même nombre force ivfflat à sonder tous les clusters, ce qui
+    # rend la recherche exacte plutôt qu'approximative. Voir /retrieve.
+    ivfflat_lists: int = int(os.getenv("MATCHING_IVFFLAT_LISTS", "100"))
 
 
 settings = Settings()
@@ -114,6 +131,18 @@ _skill_embedding_model_lock = Lock()
 _skill_embedding_model_last_failure: Optional[float] = None  # time.monotonic() du dernier échec de chargement
 _SKILL_EMBEDDING_RETRY_COOLDOWN_S = 300
 _pgvector_ready = False
+_reindex_lock = Lock()
+_reindex_status: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "processed": 0,
+    "updated": 0,
+    "skipped": 0,
+    "errors": 0,
+    "total_seen": 0,
+    "last_error": None,
+}
 
 
 @app.on_event("startup")
@@ -222,6 +251,23 @@ class ScoreResponse(BaseModel):
 class ExtractResponse(BaseModel):
     text: str
     skills: List[str]
+
+
+class ReindexStatus(BaseModel):
+    running: bool
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    processed: int
+    updated: int
+    skipped: int
+    errors: int
+    total_seen: int
+    last_error: Optional[str] = None
+
+
+class RetrieveRequest(BaseModel):
+    job: JobPayload
+    limit: int = Field(default_factory=lambda: settings.retrieve_semantic_top_k, ge=1, le=1000)
 
 
 class SkillEmbeddingTuningRead(BaseModel):
@@ -587,6 +633,209 @@ def embedding_text(value: str, kind: str) -> str:
         return value
     prefix = "query: " if kind == "query" else "passage: "
     return f"{prefix}{value}"
+
+
+def fetch_wp_resumes_page(offset: int, limit: int) -> List[dict]:
+    """Une page de /keoni/v1/cvs côté keoni-bridge, sans filtre -- utilisé
+    par la réindexation complète pour parcourir tout le vivier de CV."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    url = f"{settings.wp_api_base_url}/cvs"
+    response = requests.get(
+        url,
+        params={"offset": offset, "limit": limit},
+        headers={"X-API-Key": settings.wp_api_key},
+        timeout=30,
+    )
+    response.raise_for_status()
+    items = response.json().get("items")
+    return items if isinstance(items, list) else []
+
+
+def fetch_wp_resumes_by_ids(ids: Sequence[int]) -> List[dict]:
+    """Fiches candidat complètes pour une liste d'id -- utilisé par /retrieve
+    pour récupérer les CV retenus par la recherche vectorielle/taxonomie
+    avant de les renvoyer à n8n. keoni-bridge plafonne `limit` à 500 côté
+    serveur, d'où le découpage en pages ici."""
+    if not ids:
+        return []
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    url = f"{settings.wp_api_base_url}/cvs"
+    headers = {"X-API-Key": settings.wp_api_key}
+    results: List[dict] = []
+    page_size = 500
+    for start in range(0, len(ids), page_size):
+        chunk = ids[start : start + page_size]
+        response = requests.get(
+            url,
+            params={"ids": ",".join(str(i) for i in chunk), "limit": len(chunk)},
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        items = response.json().get("items")
+        if isinstance(items, list):
+            results.extend(items)
+    return results
+
+
+def resume_to_cv_payload(resume: dict) -> "CvPayload":
+    metadata = resume.get("metadata")
+    return CvPayload(
+        id=int(resume.get("id") or 0),
+        candidate_email=resume.get("email") or None,
+        application_title=resume.get("application_title") or resume.get("title") or None,
+        resume=resume.get("resume") or None,
+        text_content=resume.get("text_content") or None,
+        skills=resume.get("skills") or None,
+        keywords=resume.get("keywords"),
+        metadata=metadata if isinstance(metadata, dict) else None,
+        file_path=resume.get("file_path") or None,
+    )
+
+
+def reindex_cv_text(resume: dict) -> str:
+    """Texte utilisé pour l'indexation, fichier réel prioritaire.
+
+    assemble_cv_text() regarde `text_content`/`resume`/`skills` avant le
+    fichier -- correct pour /extract/cv et /score, où ces champs viennent
+    souvent d'une vraie synchronisation. Mais côté keoni-bridge,
+    `text_content` de /keoni/v1/cvs (build_resume_text_content()) n'est
+    qu'un résumé superficiel (titre + nom + mots-clés), quasi toujours non
+    vide même quand un vrai CV est uploadé -- avec la priorité par défaut,
+    la réindexation n'ouvrirait donc quasiment jamais le fichier réel.
+    On force ici le fichier en premier pour tout candidat qui en a un.
+    """
+    file_path = resume.get("file_path")
+
+    if file_path:
+        is_remote = urlparse(file_path).scheme in ("http", "https")
+        resolved = fetch_remote_file(file_path) if is_remote else resolve_file_path(file_path)
+
+        if resolved:
+            try:
+                file_text = text_from_file(resolved)
+                if file_text:
+                    return file_text
+            finally:
+                if is_remote:
+                    resolved.unlink(missing_ok=True)
+
+    return assemble_cv_text(resume_to_cv_payload(resume))
+
+
+def reindex_cv_batch(resumes: List[dict]) -> None:
+    """Embed + upsert dans cv_embeddings les CV d'une page dont le texte a
+    changé (gated par content_hash, comme /score) -- idempotent, une
+    réindexation relancée ne retraite que ce qui a bougé."""
+    engine = get_engine()
+    if engine is None:
+        raise RuntimeError("Base de données indisponible, réindexation impossible")
+
+    to_embed: List[Tuple[int, str]] = []
+
+    with engine.begin() as conn:
+        for resume in resumes:
+            cv_id = int(resume.get("id") or 0)
+            if cv_id <= 0:
+                continue
+
+            try:
+                text_value = reindex_cv_text(resume)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Réindexation CV %s: extraction échouée: %s", cv_id, exc)
+                _reindex_status["errors"] += 1
+                continue
+
+            if not text_value:
+                _reindex_status["skipped"] += 1
+                continue
+
+            new_hash = content_hash(text_value)
+            existing = conn.execute(
+                select(CvEmbedding.content_hash).where(CvEmbedding.cv_id == cv_id)
+            ).first()
+            if existing and existing.content_hash == new_hash:
+                _reindex_status["skipped"] += 1
+                continue
+
+            to_embed.append((cv_id, text_value))
+
+        if not to_embed:
+            return
+
+        vectors = encode_texts([embedding_text(text_value, "passage") for _, text_value in to_embed])
+        for (cv_id, text_value), vector in zip(to_embed, vectors):
+            skills = sorted(find_skills(text_value))
+            stmt = pg_insert(CvEmbedding).values(
+                cv_id=cv_id,
+                content_hash=content_hash(text_value),
+                embedding=vector.tolist(),
+                skills_canonical=skills,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[CvEmbedding.cv_id],
+                set_={
+                    "content_hash": stmt.excluded.content_hash,
+                    "embedding": stmt.excluded.embedding,
+                    "skills_canonical": stmt.excluded.skills_canonical,
+                    "updated_at": func.now(),
+                },
+            )
+            conn.execute(stmt)
+            _reindex_status["updated"] += 1
+
+
+def run_full_reindex() -> None:
+    with _reindex_lock:
+        if _reindex_status["running"]:
+            return
+        _reindex_status.update(
+            running=True,
+            started_at=time.time(),
+            finished_at=None,
+            processed=0,
+            updated=0,
+            skipped=0,
+            errors=0,
+            total_seen=0,
+            last_error=None,
+        )
+
+    try:
+        offset = 0
+        while True:
+            try:
+                resumes = fetch_wp_resumes_page(offset, settings.reindex_page_size)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Réindexation: page offset=%s illisible: %s", offset, exc)
+                _reindex_status["errors"] += 1
+                _reindex_status["last_error"] = str(exc)
+                break
+
+            if not resumes:
+                break
+
+            _reindex_status["total_seen"] += len(resumes)
+
+            try:
+                reindex_cv_batch(resumes)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Réindexation: lot offset=%s échoué: %s", offset, exc)
+                _reindex_status["errors"] += 1
+                _reindex_status["last_error"] = str(exc)
+
+            _reindex_status["processed"] += len(resumes)
+
+            if len(resumes) < settings.reindex_page_size:
+                break
+            offset += settings.reindex_page_size
+    finally:
+        _reindex_status["running"] = False
+        _reindex_status["finished_at"] = time.time()
 
 
 def get_cross_encoder() -> Optional[CrossEncoder]:
@@ -1114,6 +1363,93 @@ def extract_job(job: JobPayload, _: None = Depends(require_api_key)) -> ExtractR
     if not prepared.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
     return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
+
+
+@app.post("/admin/reindex-cvs", response_model=ReindexStatus)
+def start_reindex_cvs(background_tasks: BackgroundTasks, _: None = Depends(require_api_key)) -> ReindexStatus:
+    """Réindexe tout le vivier de CV (embedding + compétences canoniques ROME)
+    dans cv_embeddings, en tâche de fond.
+
+    Idempotent et incrémental (gated par content_hash comme /score) : ne
+    retraite que ce qui a changé, donc peut être relancé périodiquement
+    (nouveaux CV) sans coût pour ce qui est déjà à jour. Voir
+    /admin/reindex-cvs/status pour suivre la progression -- avec ~33k CV
+    ça tourne en tâche de fond sur plusieurs minutes, pas synchrone.
+    """
+    if not _pgvector_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
+    if _reindex_status["running"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Une réindexation est déjà en cours")
+
+    background_tasks.add_task(run_full_reindex)
+    return ReindexStatus(**_reindex_status)
+
+
+@app.get("/admin/reindex-cvs/status", response_model=ReindexStatus)
+def get_reindex_status(_: None = Depends(require_api_key)) -> ReindexStatus:
+    return ReindexStatus(**_reindex_status)
+
+
+@app.post("/retrieve")
+def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> dict:
+    """Récupération hybride sur l'ensemble du vivier de CV indexé, en amont
+    du scoring -- remplace le filtrage par titre/mots-clés (LIKE SQL côté
+    WordPress) qui ne peut structurellement pas couvrir tout le vivier.
+
+    Deux canaux complémentaires, unis (pas l'un OU l'autre) :
+    - sémantique : similarité cosinus exacte (ivfflat.probes = lists, donc
+      sonde tous les clusters -- pas d'approximation) sur TOUTE la table
+      cv_embeddings, sans restriction de cv_id ;
+    - taxonomie : chevauchement de compétences canoniques ROME, pour ne pas
+      perdre un candidat à la compétence exacte que l'embedding sous-classerait.
+
+    Renvoie les fiches candidat complètes (via keoni-bridge), prêtes pour la
+    suite du pipeline n8n existante (Normalize Job + CV Fast).
+    """
+    if not _pgvector_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
+
+    engine = get_engine()
+    if engine is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Base de données indisponible")
+
+    job = payload.job
+    prepared_job = prepare_job(job)
+    if not prepared_job.text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
+
+    job_vector = encode_texts([embedding_text(prepared_job.text, "query")])[0]
+    required_skills = sorted(prepared_job.skills_canonical)
+
+    with engine.begin() as conn:
+        conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
+
+        distance = CvEmbedding.embedding.cosine_distance(job_vector.tolist()).label("distance")
+        semantic_rows = conn.execute(
+            select(CvEmbedding.cv_id).order_by(distance.asc()).limit(payload.limit)
+        ).all()
+        semantic_ids = [row.cv_id for row in semantic_rows]
+
+        taxonomy_ids: List[int] = []
+        if required_skills:
+            taxonomy_rows = conn.execute(
+                select(CvEmbedding.cv_id)
+                .where(CvEmbedding.skills_canonical.overlap(required_skills))
+                .limit(settings.retrieve_taxonomy_top_k)
+            ).all()
+            taxonomy_ids = [row.cv_id for row in taxonomy_rows]
+
+    combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids))
+    cvs = fetch_wp_resumes_by_ids(combined_ids)
+
+    return {
+        "job_id": job.id,
+        "count": len(cvs),
+        "semantic_count": len(semantic_ids),
+        "taxonomy_count": len(taxonomy_ids),
+        "job": job.model_dump(),
+        "cvs": cvs,
+    }
 
 
 @app.post("/score", response_model=ScoreResponse)

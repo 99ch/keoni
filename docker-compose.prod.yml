@@ -62,6 +62,11 @@ services:
       MATCHING_MIN_TITLE_HITS: ${MATCHING_MIN_TITLE_HITS:-3}
       POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       TZ: ${TIMEZONE}
+      # Récupération/réindexation sur tout le vivier de CV (/retrieve,
+      # /admin/reindex-cvs) -- même identifiant keoni-bridge que n8n. Défaut
+      # aligné sur l'URL déjà en dur dans le workflow n8n (Fetch CV L1/L2/L3).
+      WP_API_BASE_URL: ${WP_API_BASE_URL:-https://keoni-consulting.net/wp-json/keoni/v1}
+      WP_API_KEY: ${WP_API_KEY}
     depends_on:
       db:
         condition: service_healthy

@@ -64,6 +64,23 @@ def init_db() -> bool:
         with engine.begin() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             Base.metadata.create_all(bind=conn)
+            # create_all() ne modifie jamais une table déjà existante : les
+            # colonnes ajoutées après coup à un modèle (ex. skills_canonical)
+            # doivent être migrées explicitement ici pour rester
+            # auto-suffisant en prod sans dépendre d'un `alembic upgrade`
+            # manuel (jamais exécuté par le déploiement, voir alembic/).
+            conn.execute(
+                text(
+                    "ALTER TABLE cv_embeddings "
+                    "ADD COLUMN IF NOT EXISTS skills_canonical TEXT[] NOT NULL DEFAULT '{}'"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_cv_embeddings_skills_canonical "
+                    "ON cv_embeddings USING gin (skills_canonical)"
+                )
+            )
         return True
     except Exception as exc:  # noqa: BLE001
         logging.warning("Initialisation pgvector impossible, fallback FAISS: %s", exc)
