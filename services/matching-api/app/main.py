@@ -1253,26 +1253,32 @@ def representative_excerpts(text: str, terms: List[str], max_items: int, window:
     fenêtre de caractères autour de la 1re occurrence de chaque terme à la
     place, ce qui donne des fragments plus courts que les lignes complètes
     de leur exemple.
+
+    Dédoublonné par ZONE couverte, pas juste par texte de l'extrait
+    identique : plusieurs termes qui tombent dans la même phrase (ex. une
+    ligne "Compétences : PHP, Laravel, Git...") produiraient sinon une
+    série de fragments quasi identiques, un par terme de cette même ligne.
     """
     if not text or not terms:
         return []
     lower_text = text.lower()
     excerpts: List[str] = []
-    seen: set[str] = set()
+    covered: List[tuple[int, int]] = []
     for term in terms:
         idx = lower_text.find(term.lower())
         if idx == -1:
             continue
+        term_end = idx + len(term)
+        if any(idx < c_end and term_end > c_start for c_start, c_end in covered):
+            continue
         start = max(0, idx - window // 2)
-        end = min(len(text), idx + len(term) + window // 2)
+        end = min(len(text), term_end + window // 2)
         snippet = text[start:end].strip()
         if start > 0:
             snippet = "…" + snippet
         if end < len(text):
             snippet += "…"
-        if snippet in seen:
-            continue
-        seen.add(snippet)
+        covered.append((start, end))
         excerpts.append(snippet)
         if len(excerpts) >= max_items:
             break
