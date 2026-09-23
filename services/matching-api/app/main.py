@@ -789,7 +789,10 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
             _reindex_status["updated"] += 1
 
 
-def run_full_reindex() -> None:
+def run_full_reindex(max_total: Optional[int] = None) -> None:
+    """`max_total` borne le nombre de CV traités -- utilisé pour valider
+    l'extraction sur un échantillon avant de lancer tout le vivier (voir
+    /admin/reindex-cvs?limit=N). None = tout le vivier, sans limite."""
     with _reindex_lock:
         if _reindex_status["running"]:
             return
@@ -807,9 +810,13 @@ def run_full_reindex() -> None:
 
     try:
         offset = 0
-        while True:
+        while max_total is None or offset < max_total:
+            page_size = settings.reindex_page_size
+            if max_total is not None:
+                page_size = min(page_size, max_total - offset)
+
             try:
-                resumes = fetch_wp_resumes_page(offset, settings.reindex_page_size)
+                resumes = fetch_wp_resumes_page(offset, page_size)
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Réindexation: page offset=%s illisible: %s", offset, exc)
                 _reindex_status["errors"] += 1
@@ -830,9 +837,9 @@ def run_full_reindex() -> None:
 
             _reindex_status["processed"] += len(resumes)
 
-            if len(resumes) < settings.reindex_page_size:
+            if len(resumes) < page_size:
                 break
-            offset += settings.reindex_page_size
+            offset += page_size
     finally:
         _reindex_status["running"] = False
         _reindex_status["finished_at"] = time.time()
@@ -1366,9 +1373,17 @@ def extract_job(job: JobPayload, _: None = Depends(require_api_key)) -> ExtractR
 
 
 @app.post("/admin/reindex-cvs", response_model=ReindexStatus)
-def start_reindex_cvs(background_tasks: BackgroundTasks, _: None = Depends(require_api_key)) -> ReindexStatus:
-    """Réindexe tout le vivier de CV (embedding + compétences canoniques ROME)
+def start_reindex_cvs(
+    background_tasks: BackgroundTasks,
+    limit: Optional[int] = None,
+    _: None = Depends(require_api_key),
+) -> ReindexStatus:
+    """Réindexe le vivier de CV (embedding + compétences canoniques ROME)
     dans cv_embeddings, en tâche de fond.
+
+    `limit` (optionnel, en query string) borne le nombre de CV traités --
+    utile pour valider l'extraction sur un échantillon avant de lancer tout
+    le vivier. Omis ou absent = tout le vivier, sans limite.
 
     Idempotent et incrémental (gated par content_hash comme /score) : ne
     retraite que ce qui a changé, donc peut être relancé périodiquement
@@ -1381,7 +1396,7 @@ def start_reindex_cvs(background_tasks: BackgroundTasks, _: None = Depends(requi
     if _reindex_status["running"]:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Une réindexation est déjà en cours")
 
-    background_tasks.add_task(run_full_reindex)
+    background_tasks.add_task(run_full_reindex, limit)
     return ReindexStatus(**_reindex_status)
 
 
