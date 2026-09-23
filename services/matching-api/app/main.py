@@ -74,7 +74,12 @@ class Settings:
     w_qualification: float = float(os.getenv("MATCHING_W_QUALIFICATION", str(DEFAULT_WEIGHTS["qualification"])))
     hard_filter_jobtype: bool = os.getenv("MATCHING_HARD_FILTER_JOBTYPE", "1") == "1"
     hard_filter_qualification: bool = os.getenv("MATCHING_HARD_FILTER_QUALIFICATION", "1") == "1"
-    embed_batch_size: int = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+    # 64 plutôt que 32 : moins d'appels/overhead Python par lot sur CPU pour
+    # le réindex complet (lots de reindex_page_size=100 textes) ; sans effet
+    # sur /score en usage normal (nombre de CV par offre très inférieur à
+    # 32 dans l'immense majorité des cas -- batch_size est un plafond, pas
+    # un nombre de lots imposé).
+    embed_batch_size: int = int(os.getenv("EMBED_BATCH_SIZE", "64"))
     preload_model: bool = os.getenv("MATCHING_PRELOAD_MODEL", "1") == "1"
     data_dir: Path = Path(os.getenv("DATA_DIR", "/data/cv_raw"))
     file_fetch_timeout_seconds: int = int(os.getenv("MATCHING_FILE_FETCH_TIMEOUT", "15"))
@@ -111,11 +116,15 @@ class Settings:
     wp_api_base_url: str = os.getenv("WP_API_BASE_URL", "https://keoni-consulting.net").rstrip("/")
     wp_api_key: str = os.getenv("WP_API_KEY", "")
     reindex_page_size: int = int(os.getenv("MATCHING_REINDEX_PAGE_SIZE", "100"))
-    # Téléchargement + extraction Tika/PyMuPDF mesurés à ~1.1s/CV en série
-    # sur l'échantillon de validation (50 CV, 2026-09-23) -- entièrement de
-    # l'attente réseau (fichier WordPress + serveur Tika local), donc
-    # parallélisable sans contention CPU. ~10-11h en série sur ~33k CV
-    # ramenées à quelques heures avec ce pool.
+    # Téléchargement + extraction mesurés à ~1.1s/CV en série sur
+    # l'échantillon de validation (50 CV, 2026-09-23). Constaté en prod (VPS
+    # à 4 vCPU, partagé avec d'autres stacks) : ce n'est PAS purement de
+    # l'attente réseau comme supposé initialement -- Tika/PyMuPDF et surtout
+    # l'OCR Tesseract des CV scannés sont CPU-bound (~303% CPU observé avec 8
+    # workers). Le pool reste utile (recouvre l'attente réseau avec le CPU
+    # des autres threads) mais le gain réel est plus proche de ~1.2-1.5x que
+    # d'un vrai x8 sur ce matériel -- voir OCR_DPI (app/extraction.py) et
+    # embed_batch_size ci-dessous pour les leviers CPU.
     reindex_download_workers: int = int(os.getenv("MATCHING_REINDEX_DOWNLOAD_WORKERS", "8"))
     retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
     retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
