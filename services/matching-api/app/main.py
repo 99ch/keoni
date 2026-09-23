@@ -102,12 +102,12 @@ class Settings:
     # Réindexation/récupération sur l'ensemble du vivier de CV (voir
     # /admin/reindex-cvs et /retrieve) -- mêmes identifiants que ceux déjà
     # utilisés par n8n pour appeler keoni-bridge, partagés via .env.prod.
-    # n8n appelle keoni-bridge avec cette URL en dur (voir Fetch CV L1/L2/L3
-    # dans le workflow), WP_API_BASE_URL n'y est pas référencé -- on garde le
-    # même défaut connu-fonctionnel plutôt que de dépendre d'une variable
-    # d'env dont le format exact n'est pas garanti, tout en la laissant
-    # surchargeable.
-    wp_api_base_url: str = os.getenv("WP_API_BASE_URL", "https://keoni-consulting.net/wp-json/keoni/v1").rstrip("/")
+    # En prod, WP_API_BASE_URL (.env.prod, partagé avec n8n) ne contient que
+    # le domaine racine (ex. "https://keoni-consulting.net"), sans le chemin
+    # REST -- confirmé en prod le 2026-09-23 après un 404 sur la première
+    # réindexation. Le chemin /wp-json/keoni/v1 est donc ajouté ici, pas
+    # supposé déjà présent dans la variable.
+    wp_api_base_url: str = os.getenv("WP_API_BASE_URL", "https://keoni-consulting.net").rstrip("/")
     wp_api_key: str = os.getenv("WP_API_KEY", "")
     reindex_page_size: int = int(os.getenv("MATCHING_REINDEX_PAGE_SIZE", "100"))
     retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
@@ -641,7 +641,7 @@ def fetch_wp_resumes_page(offset: int, limit: int) -> List[dict]:
     if not settings.wp_api_base_url or not settings.wp_api_key:
         raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
 
-    url = f"{settings.wp_api_base_url}/cvs"
+    url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/cvs"
     response = requests.get(
         url,
         params={"offset": offset, "limit": limit},
@@ -663,7 +663,7 @@ def fetch_wp_resumes_by_ids(ids: Sequence[int]) -> List[dict]:
     if not settings.wp_api_base_url or not settings.wp_api_key:
         raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
 
-    url = f"{settings.wp_api_base_url}/cvs"
+    url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/cvs"
     headers = {"X-API-Key": settings.wp_api_key}
     results: List[dict] = []
     page_size = 500
