@@ -441,6 +441,35 @@ def test_custom_weights_are_respected():
     assert result.score == 50.0
 
 
+def test_final_score_exposes_missing_skills_and_keywords():
+    # skills_missing/keyword_missing alimentent le texte d'explication
+    # détaillé ("Compétences manquantes côté offre : ...") -- calculés en
+    # interne par skills_component()/priority_keyword_component() puis
+    # jetés avant ce champ, voir compute_final_score().
+    job = make_job(
+        skills_canonical={"Python", "SQL", "Docker"},
+        keyword_terms_raw=["Python", "Kubernetes"],
+    )
+    cv = make_cv(skills_canonical={"Python"})
+    result = compute_final_score(job, cv, similarity=1.0, rerank_score=None)
+
+    assert result.skill_hits == ["Python"]
+    assert result.skills_missing == ["Docker", "SQL"]
+    assert result.keyword_hits == ["Python"]
+    assert result.keyword_missing == ["Kubernetes"]
+
+
+def test_final_score_missing_lists_empty_without_signal():
+    # Pas de compétences/mots-clés côté offre -> pas de signal -> pas de
+    # liste de manquants fabriquée artificiellement.
+    job = make_job(skills_canonical=set(), keyword_terms_raw=[])
+    cv = make_cv(skills_canonical={"Python"})
+    result = compute_final_score(job, cv, similarity=1.0, rerank_score=None)
+
+    assert result.skills_missing == []
+    assert result.keyword_missing == []
+
+
 # ── réglage live du crédit sémantique de compétences ──────────────────────
 
 

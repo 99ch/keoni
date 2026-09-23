@@ -611,6 +611,14 @@ class ScoreResult:
     breakdown: dict = field(default_factory=dict)
     low_confidence_components: List[str] = field(default_factory=list)
     weights: dict = field(default_factory=dict)
+    # Le "requis - matched" était déjà calculé en interne par
+    # skills_component()/priority_keyword_component() (variable `unmatched`)
+    # puis jeté -- juste renvoyé en plus ici, sans recalcul, pour permettre
+    # un texte d'explication aussi détaillé que celui d'AI Real-Time
+    # ("Mots-clés prioritaires manquants : ...", pas seulement "quelques
+    # mots-clés en commun").
+    skills_missing: List[str] = field(default_factory=list)
+    keyword_missing: List[str] = field(default_factory=list)
 
 
 def compute_final_score(
@@ -700,6 +708,9 @@ def compute_final_score(
     low_confidence = [name for name, _value, ok in structured if not ok]
     _matched, all_priority_terms = resolve_priority_keywords(job, effective_cv_skills)
 
+    skills_missing = sorted(job.skills_canonical - set(skill_hits)) if skills_ok else []
+    keyword_missing = sorted(set(all_priority_terms) - set(keyword_hits)) if keywords_ok else []
+
     return ScoreResult(
         score=round(final * 100, 2),
         semantic=semantic,
@@ -710,4 +721,6 @@ def compute_final_score(
         breakdown=breakdown,
         low_confidence_components=low_confidence,
         weights=w,
+        skills_missing=skills_missing,
+        keyword_missing=keyword_missing,
     )

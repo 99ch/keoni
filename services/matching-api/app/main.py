@@ -1234,15 +1234,28 @@ def build_score(
     weaknesses: List[str] = []
     low = set(result.low_confidence_components)
 
-    if result.keyword_hits:
-        strengths.append(f"Mots-clés ({', '.join(result.keyword_hits[:5])})")
-    elif job.keyword_terms_raw:
-        weaknesses.append("Aucun mot-clé commun identifié")
+    # Texte détaillé (comptes + listes exactes), pas juste "quelques
+    # mots-clés en commun" -- demandé explicitement pour retrouver le
+    # niveau de détail de l'explication d'AI Real-Time (rhconsole),
+    # rendu possible par skills_missing/keyword_missing (scoring.py).
+    if job.keyword_terms_raw:
+        if result.keyword_hits:
+            strengths.append(
+                f"Mots-clés prioritaires du recruteur : {len(result.keyword_hits)}/{result.keyword_total} "
+                f"trouvés ({', '.join(result.keyword_hits)})."
+            )
+        else:
+            weaknesses.append("Aucun mot-clé prioritaire du recruteur trouvé dans le CV.")
+        if result.keyword_missing:
+            weaknesses.append(f"Mots-clés prioritaires manquants : {', '.join(result.keyword_missing)}.")
 
-    if result.skill_hits:
-        strengths.append(f"Compétences reconnues ({', '.join(result.skill_hits[:5])})")
-    elif job.skills_canonical:
-        weaknesses.append("Aucune compétence reconnue en commun")
+    if job.skills_canonical:
+        if result.skill_hits:
+            strengths.append(f"Compétences requises alignées : {', '.join(result.skill_hits)}.")
+        else:
+            weaknesses.append("Aucune compétence requise reconnue en commun.")
+        if result.skills_missing:
+            weaknesses.append(f"Compétences manquantes côté offre : {', '.join(result.skills_missing)}.")
 
     title_overlap = job.tokens.intersection(cv.title_tokens)
     if title_overlap:
@@ -1272,9 +1285,10 @@ def build_score(
         # reste None dans ce cas, voir experience_component().
         required_years = result.breakdown.get("experience_required_years")
         if required_years is not None and cv.experience_years >= required_years:
-            strengths.append(f"Expérience suffisante ({cv.experience_years:g} ans)")
+            strengths.append(f"Expérience détectée : {cv.experience_years:g} ans pour {required_years:g} requis.")
         else:
-            weaknesses.append(f"Expérience inférieure ({cv.experience_years:g} ans)")
+            required_label = f"{required_years:g}" if required_years is not None else "?"
+            weaknesses.append(f"Expérience détectée : {cv.experience_years:g} ans pour {required_label} requis.")
 
     if "salary" not in low:
         if result.breakdown["salary"] == 1.0:
@@ -1288,12 +1302,35 @@ def build_score(
         else:
             weaknesses.append("Localisation différente")
 
+    # Phrase de synthèse (même esprit que le paragraphe d'introduction
+    # d'AI Real-Time : quelles sections ont un vrai signal + mots-clés
+    # principaux), affichée en tête de la modale "Analyser" côté keoni-bridge.
+    _component_labels_fr = {
+        "skills": "compétences",
+        "keywords": "mots-clés",
+        "experience": "expérience",
+        "jobtype": "type de contrat",
+        "category": "catégorie",
+        "location": "localisation",
+        "salary": "salaire",
+        "qualification": "qualification",
+    }
+    present_sections = [
+        label for key, label in _component_labels_fr.items() if key not in low
+    ] + ["signaux lexicaux"]
+    summary = f"Score {result.score:g}% construit sur des sections structurées : {', '.join(present_sections)}."
+    if result.keyword_hits:
+        summary += f" Mots-clés principaux : {', '.join(result.keyword_hits[:8])}."
+
     extra = {
+        "summary": summary,
         "vector_similarity": round(float(similarity), 4),
         "cross_encoder_score": round(float(rerank_score), 4) if rerank_score is not None else None,
         "keyword_hits": result.keyword_hits,
         "keyword_total": result.keyword_total,
+        "keyword_missing": result.keyword_missing,
         "skill_hits": result.skill_hits,
+        "skills_missing": result.skills_missing,
         "scoring_profile": job.scoring_profile,
         "rank": rank + 1,
         "cv_category": cv.category,
