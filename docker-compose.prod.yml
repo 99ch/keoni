@@ -75,7 +75,14 @@ services:
     volumes:
       - ./volumes/models:/models
       - ./volumes/data/cv_raw:/data/cv_raw
-    mem_limit: 1536m
+    # 2560m plutôt que 1536m : le réindex complet (8 workers concurrents,
+    # extraction PDF/OCR + modèle d'embedding chargé) est mesuré à ~76% de
+    # l'ancienne limite en usage normal, avec des pics proches de l'OOM sur
+    # les lots contenant plusieurs CV scannés (rendu pdftoppm haute
+    # résolution). VPS partagé (4 vCPU/7.6GiB, ~4.4GiB dispo au moment du
+    # changement, 2026-09-23) -- marge choisie pour rester loin de l'OOM
+    # sans accaparer la RAM des autres stacks sur la même machine.
+    mem_limit: 2560m
     cap_drop:
       - ALL
     security_opt:
