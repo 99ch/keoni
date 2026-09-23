@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import tempfile
@@ -126,6 +126,13 @@ class Settings:
     # d'un vrai x8 sur ce matériel -- voir OCR_DPI (app/extraction.py) et
     # embed_batch_size ci-dessous pour les leviers CPU.
     reindex_download_workers: int = int(os.getenv("MATCHING_REINDEX_DOWNLOAD_WORKERS", "8"))
+    # _reindex_status n'est pas persisté (en mémoire) : un redéploiement
+    # tue silencieusement le backfill en cours, sans reprise -- constaté
+    # en prod, plusieurs redéploiements ont dû être relancés à la main
+    # (2026-09-23). content_hash rend un passage complet idempotent (les
+    # CV déjà à jour sont sautés vite), donc le redéclencher à chaque
+    # démarrage est sûr -- désactivable si jamais ça devient gênant.
+    reindex_resume_on_startup: bool = os.getenv("MATCHING_REINDEX_RESUME_ON_STARTUP", "1") == "1"
     retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
     retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
     # `lists = 100` sur l'index ivfflat (voir app/models.py) -- fixer les
@@ -209,6 +216,26 @@ def warmup_cross_encoder_model() -> None:
             logging.info("Cross-encoder preloaded and warmed in %d ms", elapsed_ms)
         except Exception as exc:  # noqa: BLE001
             logging.warning("Cross-encoder warmup predict failed: %s", exc)
+
+
+@app.on_event("startup")
+def resume_reindex_on_startup() -> None:
+    """Relance le backfill CV à chaque démarrage du conteneur (voir
+    Settings.reindex_resume_on_startup) : un redéploiement tue le
+    précédent sans reprise, content_hash rend chaque passage idempotent
+    (déjà-à-jour = sauté vite), donc c'est sûr de le redéclencher plutôt
+    que d'exiger un relance manuelle après chaque déploiement.
+
+    Thread daemon nu (pas BackgroundTasks, qui dépend d'une requête HTTP
+    en cours) : doit démarrer en tâche de fond sans bloquer le reste du
+    startup pendant potentiellement des heures.
+    """
+    if not settings.reindex_resume_on_startup:
+        return
+    if not _pgvector_ready:
+        return
+    Thread(target=run_full_reindex, daemon=True).start()
+    logging.info("Reprise automatique du reindex CV déclenchée au démarrage")
 
 
 class JobPayload(BaseModel):
