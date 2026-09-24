@@ -151,4 +151,5 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT || '22' }}
           script: |
+            cd "${{ secrets.DEPLOY_PATH }}"
             bash ops/scripts/prune_matching_api_images.sh || true
