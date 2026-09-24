@@ -879,10 +879,19 @@ def run_full_reindex(max_total: Optional[int] = None) -> None:
             try:
                 resumes = fetch_wp_resumes_page(offset, page_size)
             except Exception as exc:  # noqa: BLE001
-                logging.warning("Réindexation: page offset=%s illisible: %s", offset, exc)
+                # Une erreur transitoire (timeout WP, etc.) sur une seule
+                # page ne doit pas avorter tout le reste du vivier --
+                # observé en prod : un seul read timeout après ~12800 CV
+                # a arrêté le backfill à ~38%, laissant les ~21000 CV
+                # restants intouchés pendant ~11h sans que rien ne le
+                # relance (2026-09-24). On saute cette page et on
+                # continue : elle sera reprise au prochain passage complet
+                # (idempotent, content_hash), pas perdue pour de bon.
+                logging.warning("Réindexation: page offset=%s illisible, page sautée: %s", offset, exc)
                 _reindex_status["errors"] += 1
                 _reindex_status["last_error"] = str(exc)
-                break
+                offset += page_size
+                continue
 
             if not resumes:
                 break
