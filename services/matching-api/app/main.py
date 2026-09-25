@@ -21,7 +21,7 @@ import faiss
 import numpy as np
 import pytesseract
 import requests
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response, status
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -1538,6 +1538,101 @@ def extract_job(job: JobPayload, _: None = Depends(require_api_key)) -> ExtractR
     prepared = prepare_job(job)
     if not prepared.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
+    return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
+
+
+def _wrap_line_to_width(text_value: str, font_name: str, font_size: float, max_width: float) -> List[str]:
+    """Découpe une ligne en sous-lignes tenant dans max_width -- port fidèle
+    d'AI Real-Time (main.py::_wrap_line_to_width), y compris le repli
+    caractère par caractère pour un mot seul plus large que la page."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    if not text_value:
+        return [""]
+
+    lines: List[str] = []
+    current = ""
+    for word in text_value.split(" "):
+        candidate = word if not current else f"{current} {word}"
+        if stringWidth(candidate, font_name, font_size) <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        if stringWidth(word, font_name, font_size) <= max_width:
+            current = word
+            continue
+        chunk = ""
+        for char in word:
+            if stringWidth(chunk + char, font_name, font_size) <= max_width:
+                chunk += char
+            else:
+                lines.append(chunk)
+                chunk = char
+        current = chunk
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def render_text_pdf(title: str, text_value: str) -> bytes:
+    """Rendu PDF minimal du texte extrait -- texte noir sur blanc, paginé,
+    aucune mise en forme. Port fidèle d'AI Real-Time
+    (main.py::_render_text_pdf_to_temp), volontairement disgracieux : ce
+    n'est pas un document destiné au recruteur, c'est un outil de QA pour
+    vérifier VISUELLEMENT ce que l'extraction a réellement produit --
+    colonnes mélangées, tableau mal lu, CV tronqué à une limite de page --
+    un rendu stylé masquerait justement ces défauts (demande explicite,
+    2026-09-25)."""
+    from io import BytesIO
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    margin = 40
+    max_width = width - 2 * margin
+    y = height - margin
+    c.setFont("Helvetica-Bold", 16)
+    for wrapped in _wrap_line_to_width(title, "Helvetica-Bold", 16, max_width):
+        c.drawString(margin, y, wrapped)
+        y -= 20
+    y -= 4
+    c.setFont("Helvetica", 10)
+    for line in text_value.splitlines():
+        for wrapped in _wrap_line_to_width(line, "Helvetica", 10, max_width):
+            if y < margin + 20:
+                c.showPage()
+                y = height - margin
+                c.setFont("Helvetica", 10)
+            c.drawString(margin, y, wrapped)
+            y -= 14
+    c.save()
+    return buffer.getvalue()
+
+
+@app.post("/extract/cv/pdf")
+def extract_cv_pdf(cv: CvPayload, _: None = Depends(require_api_key)) -> Response:
+    """Rendu PDF du texte extrait d'un CV, voir render_text_pdf. Alimente
+    le bouton "Voir le CV extrait" côté WordPress."""
+    prepared = prepare_cv(cv)
+    if not prepared.text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour ce CV")
+    pdf_bytes = render_text_pdf(f"CV extrait #{cv.id}", prepared.text)
+    return Response(content=pdf_bytes, media_type="application/pdf")
+
+
+@app.post("/extract/job/pdf")
+def extract_job_pdf(job: JobPayload, _: None = Depends(require_api_key)) -> Response:
+    """Équivalent de /extract/cv/pdf côté offre."""
+    prepared = prepare_job(job)
+    if not prepared.text:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
+    pdf_bytes = render_text_pdf(f"Offre extraite #{job.id}", prepared.text)
+    return Response(content=pdf_bytes, media_type="application/pdf")
     return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
 
 
