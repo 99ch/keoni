@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Index, Integer, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -72,8 +72,12 @@ class CvEmbedding(Base):
     # Libellés canoniques (taxonomie ROME, voir app/taxonomy.py::find_skills)
     # détectés dans le texte du CV au moment de l'indexation -- alimente le
     # canal de récupération "exact" en complément du canal sémantique.
+    # ARRAY(Text), pas ARRAY(String) : la colonne réelle est TEXT[] (voir
+    # db.py::_ensure_skills_canonical_column) -- un mismatch avec VARCHAR[]
+    # fait échouer l'opérateur `&&` côté Postgres ("operator does not
+    # exist: text[] && character varying[]"), observé en prod sur /retrieve.
     skills_canonical: Mapped[list[str]] = mapped_column(
-        ARRAY(String), nullable=False, server_default="{}"
+        ARRAY(Text), nullable=False, server_default="{}"
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
