@@ -18,9 +18,11 @@ documentent des bugs de production réels rencontrés en développant ce
 mécanisme (voir historique git d'AI Real-Time), pas des cas hypothétiques —
 ce sont les raisons d'être de chaque choix, à ne pas défaire par erreur.
 
-Ce module ne couvre que .pdf/.docx/.txt. Les autres formats (et le cas où
-l'extraction ci-dessous échoue/renvoie du vide) retombent sur Tika+OCR déjà
-en place dans main.py::text_from_file().
+Ce module couvre .pdf/.docx/.txt -- seul chemin d'extraction pour ces
+formats (plus de repli Tika, retiré sur demande explicite : Tika échouait
+de toute façon sur les mêmes fichiers difficiles que ce module, en pure
+perte de temps). Les autres formats (images) passent par l'OCR direct de
+main.py::text_from_file().
 """
 
 from __future__ import annotations
@@ -636,5 +638,5 @@ def extract_text(path: Path) -> str:
         return extract_text_from_docx(path)
     if suffix == ".txt":
         return extract_text_from_txt(path)
-    logger.warning("Format non supporté par ce module: %s pour %s (repli Tika)", suffix, path.name)
+    logger.warning("Format non supporté par ce module: %s pour %s (repli OCR image dans main.py)", suffix, path.name)
     return ""

@@ -7,7 +7,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
-        openjdk-21-jre-headless \
         tesseract-ocr \
         poppler-utils \
         pkg-config \

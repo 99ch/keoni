@@ -27,7 +27,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from tika import parser
 
 from app import extraction
 from app.db import get_engine, init_db
@@ -89,7 +88,6 @@ class Settings:
         "MATCHING_CROSSENCODER_MODEL", "antoinelouis/crossencoder-camembert-large-mmarcoFR"
     )
     crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "30"))
-    tika_timeout_seconds: int = int(os.getenv("MATCHING_TIKA_TIMEOUT_SECONDS", "30"))
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -463,32 +461,18 @@ def fetch_remote_file(url: str) -> Optional[Path]:
 
 
 def text_from_file(path: Path) -> str:
-    # Pour .pdf/.docx/.txt, l'extraction consciente des colonnes (portée
-    # depuis AI Real-Time) donne une bien meilleure fidélité qu'une lecture
-    # naïve, en particulier sur les CV à deux colonnes (barre latérale +
-    # corps principal) — voir app/extraction.py. Tika reste le repli pour
-    # ces formats en cas d'échec, et le seul chemin pour les autres formats.
+    # Extraction consciente des colonnes (portée depuis AI Real-Time) pour
+    # .pdf/.docx/.txt, sur demande explicite de ne pas dépendre de Tika --
+    # en plus d'une bien meilleure fidélité qu'une lecture naïve, en
+    # particulier sur les CV à deux colonnes (barre latérale + corps
+    # principal), voir app/extraction.py. Un fichier de ces formats qui
+    # échoue ici (PDF corrompu, page scannée que même l'OCR interne ne
+    # parvient pas à lire) renvoie simplement une chaîne vide -- plus de
+    # repli Tika, qui échouait de toute façon sur les mêmes fichiers
+    # difficiles (timeouts/500 observés en prod) tout en ajoutant ~30s de
+    # tentative en pure perte à chaque fois.
     if path.suffix.lower() in {".pdf", ".docx", ".txt"}:
-        column_aware_text = extraction.extract_text(path)
-        if column_aware_text:
-            return normalize_whitespace(column_aware_text)
-        logging.warning("Extraction consciente des colonnes vide pour %s, repli sur Tika", path)
-
-    try:
-        # La lib tika met déjà un timeout par défaut (60s) sur la requête HTTP
-        # au serveur Tika local, mais pas sur la phase de démarrage de la JVM
-        # avant celle-ci (on l'a vu échouer/retenter ~15-20s en test) — le
-        # rendre explicite et plus court évite qu'un fichier pathologique ne
-        # bloque une requête /score entière, dans le même esprit que le
-        # timeout OCR déjà porté d'AI Real-Time (5dd92c6) dans extraction.py.
-        parsed = parser.from_file(
-            str(path), requestOptions={"timeout": settings.tika_timeout_seconds}
-        )
-        content = parsed.get("content") or ""
-        if content.strip():
-            return normalize_whitespace(content)
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Tika parsing failed for %s: %s", path, exc)
+        return normalize_whitespace(extraction.extract_text(path))
 
     if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}:
         try:
@@ -776,9 +760,9 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
     réindexation relancée ne retraite que ce qui a bougé.
 
     Le téléchargement + extraction (reindex_cv_text) est parallélisé sur un
-    pool de threads : c'est entièrement de l'attente réseau (fichier
-    WordPress, serveur Tika local), mesuré à ~1.1s/CV en série sur
-    l'échantillon de validation -- sans ça, ~33k CV auraient pris ~10-11h.
+    pool de threads : c'est majoritairement de l'attente réseau (fichier
+    WordPress) et d'OCR, mesuré à ~1.1s/CV en série sur l'échantillon de
+    validation -- sans ça, ~33k CV auraient pris ~10-11h.
     Étape séparée de la transaction DB qui suit : SQLAlchemy/psycopg ne sont
     pas conçus pour un partage naïf de connexion entre threads.
     """

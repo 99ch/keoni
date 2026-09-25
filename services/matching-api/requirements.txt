@@ -6,7 +6,6 @@ python-multipart==0.0.9
 torch==2.3.1+cpu
 sentence-transformers==2.7.0
 faiss-cpu==1.8.0.post1
-tika==2.6.0
 pytesseract==0.3.10
 pillow==10.4.0
 numpy==1.26.4
