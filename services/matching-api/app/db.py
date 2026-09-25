@@ -81,6 +81,18 @@ def init_db() -> bool:
                     "ON cv_embeddings USING gin (skills_canonical)"
                 )
             )
+            # Texte déjà extrait au moment du réindex (voir reindex_cv_batch
+            # dans main.py) -- réutilisé par /retrieve pour éviter à /score
+            # de re-télécharger et re-extraire (OCR/Tika, jusqu'à ~50s/CV
+            # dans le pire cas) un fichier déjà traité pour une offre
+            # précédente. Root cause d'exécutions n8n de 25-35 min observées
+            # en prod (2026-09-25).
+            conn.execute(
+                text(
+                    "ALTER TABLE cv_embeddings "
+                    "ADD COLUMN IF NOT EXISTS text_content TEXT NOT NULL DEFAULT ''"
+                )
+            )
         return True
     except Exception as exc:  # noqa: BLE001
         logging.warning("Initialisation pgvector impossible, fallback FAISS: %s", exc)

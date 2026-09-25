@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, st
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tika import parser
 
@@ -817,9 +817,21 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
         for cv_id, text_value in texts.items():
             new_hash = content_hash(text_value)
             existing = conn.execute(
-                select(CvEmbedding.content_hash).where(CvEmbedding.cv_id == cv_id)
+                select(CvEmbedding.content_hash, CvEmbedding.text_content).where(
+                    CvEmbedding.cv_id == cv_id
+                )
             ).first()
             if existing and existing.content_hash == new_hash:
+                # Contenu inchangé depuis le dernier passage : pas besoin de
+                # recalculer l'embedding, mais si ce CV a été indexé avant
+                # l'ajout de text_content (colonne vide), on le comble à peu
+                # de frais -- un simple UPDATE, sans ré-encodage -- pour que
+                # /retrieve puisse déjà le servir en cache sans attendre un
+                # changement de contenu qui n'arrivera peut-être jamais.
+                if not existing.text_content:
+                    conn.execute(
+                        update(CvEmbedding).where(CvEmbedding.cv_id == cv_id).values(text_content=text_value)
+                    )
                 _reindex_status["skipped"] += 1
                 continue
 
@@ -836,6 +848,7 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                 content_hash=content_hash(text_value),
                 embedding=vector.tolist(),
                 skills_canonical=skills,
+                text_content=text_value,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=[CvEmbedding.cv_id],
@@ -843,6 +856,7 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                     "content_hash": stmt.excluded.content_hash,
                     "embedding": stmt.excluded.embedding,
                     "skills_canonical": stmt.excluded.skills_canonical,
+                    "text_content": stmt.excluded.text_content,
                     "updated_at": func.now(),
                 },
             )
@@ -1625,8 +1639,29 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
             ).all()
             taxonomy_ids = [row.cv_id for row in taxonomy_rows]
 
-    combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids))
+        combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids))
+
+        # Texte déjà extrait au moment du réindex -- injecté dans les CV
+        # renvoyés pour que /score (via assemble_cv_text) le réutilise au
+        # lieu de re-télécharger et re-extraire (OCR/Tika) le fichier à
+        # chaque appel. Un CV pas encore réindexé (text_content vide)
+        # retombe simplement sur l'ancien chemin d'extraction à la volée.
+        cached_text_rows = (
+            conn.execute(
+                select(CvEmbedding.cv_id, CvEmbedding.text_content).where(
+                    CvEmbedding.cv_id.in_(combined_ids)
+                )
+            ).all()
+            if combined_ids
+            else []
+        )
+        cached_text_by_id = {row.cv_id: row.text_content for row in cached_text_rows if row.text_content}
+
     cvs = fetch_wp_resumes_by_ids(combined_ids)
+    for cv in cvs:
+        cached_text = cached_text_by_id.get(cv.get("id"))
+        if cached_text:
+            cv["text_content"] = cached_text
 
     return {
         "job_id": job.id,

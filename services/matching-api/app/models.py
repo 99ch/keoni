@@ -79,6 +79,10 @@ class CvEmbedding(Base):
     skills_canonical: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default="{}"
     )
+    # Texte extrait du CV au moment du réindex (avant embedding) -- réutilisé
+    # par /retrieve pour éviter à /score de re-extraire (OCR/Tika) un fichier
+    # déjà traité. Voir db.py::ensure_pgvector_schema.
+    text_content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
