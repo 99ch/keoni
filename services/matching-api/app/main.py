@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import math
@@ -21,7 +22,7 @@ import faiss
 import numpy as np
 import pytesseract
 import requests
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -1615,25 +1616,31 @@ def render_text_pdf(title: str, text_value: str) -> bytes:
 
 
 @app.post("/extract/cv/pdf")
-def extract_cv_pdf(cv: CvPayload, _: None = Depends(require_api_key)) -> Response:
-    """Rendu PDF du texte extrait d'un CV, voir render_text_pdf. Alimente
-    le bouton "Voir le CV extrait" côté WordPress."""
+def extract_cv_pdf(cv: CvPayload, _: None = Depends(require_api_key)) -> dict:
+    """Rendu PDF (base64) du texte extrait d'un CV, voir render_text_pdf.
+    Alimente le bouton "Voir le CV extrait" côté WordPress.
+
+    Réponse en JSON (pas de bytes PDF bruts) : le nœud n8n "HTTP Request"
+    qui appelle cet endpoint reste ainsi identique aux autres appels
+    (parsing JSON par défaut, réponse "First Entry JSON" côté Webhook),
+    sans configuration binaire/fichier supplémentaire à faire dans le
+    workflow.
+    """
     prepared = prepare_cv(cv)
     if not prepared.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour ce CV")
     pdf_bytes = render_text_pdf(f"CV extrait #{cv.id}", prepared.text)
-    return Response(content=pdf_bytes, media_type="application/pdf")
+    return {"pdf_base64": base64.b64encode(pdf_bytes).decode("ascii")}
 
 
 @app.post("/extract/job/pdf")
-def extract_job_pdf(job: JobPayload, _: None = Depends(require_api_key)) -> Response:
-    """Équivalent de /extract/cv/pdf côté offre."""
+def extract_job_pdf(job: JobPayload, _: None = Depends(require_api_key)) -> dict:
+    """Équivalent de /extract/cv/pdf côté offre (même format JSON base64)."""
     prepared = prepare_job(job)
     if not prepared.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
     pdf_bytes = render_text_pdf(f"Offre extraite #{job.id}", prepared.text)
-    return Response(content=pdf_bytes, media_type="application/pdf")
-    return ExtractResponse(text=prepared.text, skills=sorted(prepared.skills_canonical))
+    return {"pdf_base64": base64.b64encode(pdf_bytes).decode("ascii")}
 
 
 @app.post("/admin/reindex-cvs", response_model=ReindexStatus)
