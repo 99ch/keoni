@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, st
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tika import parser
 
