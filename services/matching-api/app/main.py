@@ -559,8 +559,12 @@ def prepare_job(job: JobPayload) -> PreparedJob:
 
     # job.keywords brut (avant dédup) alimente le mécanisme "mots-clés
     # prioritaires" (couverture + pénalité core-keyword) — voir le
-    # commentaire en tête de section dans app/scoring.py.
-    keyword_terms_raw = split_priority_keyword_terms(job.keywords)
+    # commentaire en tête de section dans app/scoring.py. job.keywords vient
+    # du champ WP `tags`, qui n'a jamais de champ de saisie recruteur côté
+    # js-jobs (aucune offre observée ne l'a rempli) : on retombe sur
+    # meta.skills (champ WP `prefferdskills`, "Preferred Skills"), le seul
+    # champ effectivement et systématiquement rempli par les recruteurs.
+    keyword_terms_raw = split_priority_keyword_terms(job.keywords) or split_priority_keyword_terms(meta.get("skills"))
     scoring_profile = job.scoring_profile or normalized_text(find_first(meta, ["scoring_profile", "profil_scoring"])) or None
 
     return PreparedJob(
