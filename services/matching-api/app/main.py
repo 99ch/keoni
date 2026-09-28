@@ -310,6 +310,13 @@ class ReindexStatus(BaseModel):
 class RetrieveRequest(BaseModel):
     job: JobPayload
     limit: int = Field(default_factory=lambda: settings.retrieve_semantic_top_k, ge=1, le=1000)
+    # Plafond du canal taxonomie (chevauchement de compétences canoniques),
+    # jusqu'ici figé côté serveur (retrieve_taxonomy_top_k, def. 300) sans
+    # moyen de l'aligner sur `limit` -- un appelant qui resserre `limit` à
+    # 40 pour ne garder que les meilleurs profils voyait quand même jusqu'à
+    # 300 CV supplémentaires entrer par ce second canal. Même défaut que
+    # `limit` pour ne rien changer aux appelants existants qui ne le passent pas.
+    taxonomy_limit: int = Field(default_factory=lambda: settings.retrieve_taxonomy_top_k, ge=1, le=1000)
 
 
 class SkillEmbeddingTuningRead(BaseModel):
@@ -1721,7 +1728,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
             taxonomy_rows = conn.execute(
                 select(CvEmbedding.cv_id)
                 .where(CvEmbedding.skills_canonical.overlap(required_skills))
-                .limit(settings.retrieve_taxonomy_top_k)
+                .limit(payload.taxonomy_limit)
             ).all()
             taxonomy_ids = [row.cv_id for row in taxonomy_rows]
 
