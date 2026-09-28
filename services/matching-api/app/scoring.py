@@ -180,25 +180,32 @@ class PreparedCv:
 
 # ── Poids ──────────────────────────────────────────────────────────────────
 #
-# Mêmes ordres de grandeur que _DEFAULT_W chez AI Real-Time (semantic=0.10,
+# Valeurs IDENTIQUES à _DEFAULT_W chez AI Real-Time (semantic=0.10,
 # skills=0.40, priority_keywords=0.40, experience=0.20, education=0.08,
-# languages=0.05, contract=0.05) : Keoni n'a pas de composantes
-# education/languages séparées, remplacées ici par category/location, des
-# signaux structurels du même ordre d'importance secondaire dans le domaine
-# recrutement de Keoni. `salary` et `qualification` n'existent pas chez AI
-# Real-Time (pas de notion de prétention salariale ni de "qualifié déclaré"
-# dans leur modèle) ; ajoutés avec un poids modeste, du même ordre que
-# jobtype/location, plutôt que de les supprimer silencieusement.
+# languages=0.05, contract=0.05) -- alignement exact demandé pour comparer
+# les scores entre les deux plateformes sur un même CV/offre (2026-09-28).
+# Keoni n'a pas de composantes education/languages séparées, remplacées ici
+# par category/location au même poids : signaux structurels du même ordre
+# d'importance secondaire, mais PAS la même donnée sous-jacente
+# (category/location comparent des champs de formulaire WP, pas une
+# section formation/langues extraite du CV -- voir skills_component et les
+# fonctions de composante ci-dessous). `salary` et `qualification`
+# n'existent pas chez AI Real-Time (pas de notion de prétention salariale
+# ni de "qualifié déclaré" dans leur modèle) : gardés à poids NUL pour que
+# leur sous-score reste visible dans le détail (explication candidat) sans
+# influencer le score final -- un poids nul retire exactement leur
+# contribution de la moyenne pondérée (voir compute_final_score), ce qui
+# équivaut à les exclure du calcul sans perdre l'information affichée.
 DEFAULT_WEIGHTS: dict[str, float] = {
     "semantic": 0.10,
-    "skills": 0.35,
-    "keywords": 0.35,
+    "skills": 0.40,
+    "keywords": 0.40,
     "experience": 0.20,
     "jobtype": 0.05,
     "category": 0.08,
     "location": 0.05,
-    "salary": 0.05,
-    "qualification": 0.10,
+    "salary": 0.0,
+    "qualification": 0.0,
 }
 
 # Presets nommés, portage de _SCORING_PROFILES côté AI Real-Time : un
@@ -208,9 +215,13 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 # recruteur n'est pas data scientist, et un poids qui "sonne bien"
 # intuitivement peut réintroduire un biais déjà mesuré et corrigé).
 # Mêmes deltas que leurs presets, appliqués aux clés équivalentes chez
-# Keoni (keywords ~ priority_keywords) :
+# Keoni (keywords ~ priority_keywords) -- désormais aussi mêmes valeurs
+# ABSOLUES que leurs presets puisque DEFAULT_WEIGHTS est aligné à
+# l'identique sur _DEFAULT_W :
 #   priorite_experience : skills -0.05, keywords -0.10, experience +0.15
+#     -> skills=0.35, keywords=0.30, experience=0.35 (identique à leur preset)
 #   priorite_mots_cles  : keywords +0.10, experience -0.08
+#     -> skills=0.40, keywords=0.50, experience=0.12 (identique à leur preset)
 SCORING_PROFILES: dict[str, dict[str, float]] = {
     "equilibre": dict(DEFAULT_WEIGHTS),
     "priorite_experience": {
