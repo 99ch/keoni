@@ -721,6 +721,50 @@ def fetch_wp_resumes_by_ids(ids: Sequence[int]) -> List[dict]:
     return results
 
 
+def fetch_wp_resume_ids_by_title(title: str) -> List[int]:
+    """Id des CV dont l'intitulé de candidature correspond au titre de
+    l'offre (LIKE SQL côté keoni-bridge, class-keoni-bridge-rest.php) --
+    3e canal de /retrieve, en complément du sémantique et de la taxonomie.
+    Pagine jusqu'à épuisement, volontairement sans plafond : contrairement
+    aux deux autres canaux (qui bornent une requête pgvector sur tout le
+    vivier), ce filtre ne porte que sur les candidatures liées au titre
+    d'UNE offre précise -- nativement étroit, et c'est le comportement de
+    l'ancien noeud n8n "Fetch CV L1 Strict Title" qu'il reproduit (lui
+    n'avait déjà aucune limite ; seuls les paliers L2/L3, abandonnés, en
+    avaient une)."""
+    title = title.strip()
+    if not title:
+        return []
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/cvs"
+    headers = {"X-API-Key": settings.wp_api_key}
+    page_size = 500
+    offset = 0
+    ids: List[int] = []
+    while True:
+        response = requests.get(
+            url,
+            params={"application_title": title, "offset": offset, "limit": page_size},
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        items = response.json().get("items")
+        items = items if isinstance(items, list) else []
+        if not items:
+            break
+        for item in items:
+            cv_id = item.get("id")
+            if isinstance(cv_id, int):
+                ids.append(cv_id)
+        if len(items) < page_size:
+            break
+        offset += page_size
+    return ids
+
+
 def resume_to_cv_payload(resume: dict) -> "CvPayload":
     metadata = resume.get("metadata")
     return CvPayload(
@@ -1693,12 +1737,23 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     du scoring -- remplace le filtrage par titre/mots-clés (LIKE SQL côté
     WordPress) qui ne peut structurellement pas couvrir tout le vivier.
 
-    Deux canaux complémentaires, unis (pas l'un OU l'autre) :
+    Trois canaux complémentaires, unis (pas l'un OU l'autre) :
     - sémantique : similarité cosinus exacte (ivfflat.probes = lists, donc
       sonde tous les clusters -- pas d'approximation) sur TOUTE la table
       cv_embeddings, sans restriction de cv_id ;
     - taxonomie : chevauchement de compétences canoniques ROME, pour ne pas
-      perdre un candidat à la compétence exacte que l'embedding sous-classerait.
+      perdre un candidat à la compétence exacte que l'embedding sous-classerait ;
+    - titre : intitulé de candidature correspondant au titre de l'offre
+      (voir fetch_wp_resume_ids_by_title) -- rattrape un candidat que le
+      sémantique/la taxonomie peuvent rater (CV pauvre en texte, compétence
+      absente du référentiel), sans le plafond bas de l'ancien filtrage
+      WordPress en cascade (L1/L2/L3) qu'il remplace en partie.
+
+    Aucun des trois canaux n'est tronqué arbitrairement en cours de route :
+    chacun remonte son ensemble borné par un vrai critère (similarité,
+    recouvrement, ou -- pour le titre -- la portée déjà étroite d'un filtre
+    propre à une offre précise) ; le tri final par score réel a lieu plus
+    loin, dans /score.
 
     Renvoie les fiches candidat complètes (via keoni-bridge), prêtes pour la
     suite du pipeline n8n existante (Normalize Job + CV Fast).
@@ -1717,6 +1772,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
 
     job_vector = encode_texts([embedding_text(prepared_job.text, "query")])[0]
     required_skills = sorted(prepared_job.skills_canonical)
+    title_ids = fetch_wp_resume_ids_by_title(job.title or "")
 
     with engine.begin() as conn:
         conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
@@ -1736,7 +1792,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
             ).all()
             taxonomy_ids = [row.cv_id for row in taxonomy_rows]
 
-        combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids))
+        combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids + title_ids))
 
         # Texte déjà extrait au moment du réindex -- injecté dans les CV
         # renvoyés pour que /score (via assemble_cv_text) le réutilise au
@@ -1765,6 +1821,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
         "count": len(cvs),
         "semantic_count": len(semantic_ids),
         "taxonomy_count": len(taxonomy_ids),
+        "title_count": len(title_ids),
         "job": job.model_dump(),
         "cvs": cvs,
     }
