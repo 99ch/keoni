@@ -88,7 +88,18 @@ SemanticCreditFn = Callable[[FrozenSet[str], FrozenSet[str]], float]
 
 
 def normalize_whitespace(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
+    """Espaces normalisés + octets NUL (0x00) retirés.
+
+    Certains PDF/DOCX (notamment scannés/mal formés) produisent un texte
+    extrait contenant des \\x00 embarqués -- Postgres rejette catégoriquement
+    tout TEXT/VARCHAR qui en contient ("text fields cannot contain NUL
+    (0x00) bytes"), ce qui faisait échouer l'écriture de text_content pour
+    ces CV lors du réindex (66 CV en échec constatés en prod, 2026-09-25).
+    Retiré ici, au point de normalisation partagé par toutes les sources de
+    texte (extraction fichier, champs WP, OCR), plutôt qu'au seul point
+    d'écriture SQL : ce texte alimente aussi l'embedding et la détection de
+    compétences, où un octet NUL parasite n'a de toute façon aucun sens."""
+    return re.sub(r"\s+", " ", value.replace("\x00", "")).strip()
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")

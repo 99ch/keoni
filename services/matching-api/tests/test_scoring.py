@@ -528,3 +528,14 @@ def test_strip_html_removes_double_escaped_tags_from_paste_artifacts():
     # "environnement technique" d'une offre réelle.
     raw = "KoboToolbox. &lt;strong data-start=\"2743\" data-end=\"2772\"&gt;environnement technique :&lt;/strong&gt; python"
     assert normalize_whitespace(strip_html(raw)) == "KoboToolbox. environnement technique : python"
+
+
+def test_normalize_whitespace_strips_embedded_nul_bytes():
+    # Certains PDF/DOCX mal formés produisent un texte extrait contenant des
+    # octets NUL -- Postgres rejette catégoriquement tout TEXT en contenant
+    # ("text fields cannot contain NUL (0x00) bytes"), ce qui faisait
+    # échouer l'écriture de cv_embeddings.text_content pour 66 CV en prod
+    # lors du réindex du 2026-09-25.
+    raw = "Jean Dupont\x00 Développeur Python\x00"
+    assert "\x00" not in normalize_whitespace(raw)
+    assert normalize_whitespace(raw) == "Jean Dupont Développeur Python"
