@@ -67,6 +67,14 @@ services:
       # aligné sur l'URL déjà en dur dans le workflow n8n (Fetch CV L1/L2/L3).
       WP_API_BASE_URL: ${WP_API_BASE_URL:-https://keoni-consulting.net/wp-json/keoni/v1}
       WP_API_KEY: ${WP_API_KEY}
+      # Scoring autonome (voir app/main.py::run_autonomous_scoring_cycle) --
+      # listées ici explicitement (avec défauts) pour que leur absence dans
+      # .env.prod ne retombe pas silencieusement sur les valeurs par défaut
+      # du code sans que ce soit visible ici.
+      MATCHING_AUTONOMOUS_SCORING_ENABLED: ${MATCHING_AUTONOMOUS_SCORING_ENABLED:-1}
+      MATCHING_AUTONOMOUS_SCORING_INTERVAL_SECONDS: ${MATCHING_AUTONOMOUS_SCORING_INTERVAL_SECONDS:-300}
+      MATCHING_AUTONOMOUS_SCORING_WORKERS: ${MATCHING_AUTONOMOUS_SCORING_WORKERS:-3}
+      MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS: ${MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS:-600}
     depends_on:
       db:
         condition: service_healthy
