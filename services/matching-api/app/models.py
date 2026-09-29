@@ -127,3 +127,24 @@ class CvEmbeddingChunk(Base):
     cv_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+
+
+class JobScoringState(Base):
+    """Dernier passage du scoring autonome pour une offre (voir
+    run_autonomous_scoring_cycle() dans main.py) -- permet de savoir si une
+    offre a besoin d'être rescorée sans tout reparcourir à chaque cycle :
+    absente d'ici = jamais scorée, `last_scored_job_modified` périmé =
+    l'offre a changé côté WordPress, `last_scored_cv_pool_version` périmé =
+    le vivier de CV a avancé depuis ce dernier passage (nouveau CV ajouté,
+    CV existant réindexé) même si l'offre elle-même n'a pas bougé."""
+
+    __tablename__ = "job_scoring_state"
+
+    job_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Valeur brute renvoyée par GET /keoni/v1/job/{id} (`updated_at`) --
+    # comparaison lexicographique suffisante sur son format Y-m-d H:i:s.
+    last_scored_job_modified: Mapped[str] = mapped_column(String(32), nullable=False, server_default="")
+    last_scored_cv_pool_version: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_scored_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )

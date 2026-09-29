@@ -10,6 +10,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock, Thread
@@ -31,7 +32,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import extraction
 from app.db import get_engine, init_db
-from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk
+from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk, JobScoringState
 from app.scoring import (
     DEFAULT_WEIGHTS,
     PreparedCv,
@@ -138,6 +139,29 @@ class Settings:
     # probes au même nombre force ivfflat à sonder tous les clusters, ce qui
     # rend la recherche exacte plutôt qu'approximative. Voir /retrieve.
     ivfflat_lists: int = int(os.getenv("MATCHING_IVFFLAT_LISTS", "100"))
+    # Scoring autonome (voir run_autonomous_scoring_cycle) : remplace le
+    # bouton "Lancer IA" côté WordPress par une boucle de fond qui rescore
+    # une offre dès que son contenu change OU que le vivier de CV avance
+    # (nouveau CV, CV réindexé) -- ni l'un ni l'autre n'étaient détectés
+    # jusqu'ici sans action humaine.
+    autonomous_scoring_enabled: bool = os.getenv("MATCHING_AUTONOMOUS_SCORING_ENABLED", "1") == "1"
+    # Aligné sur le cron WP existant (keoni_bridge_scan_jobs, 5 min) --
+    # aucune raison de sonder plus souvent que la source elle-même ne se
+    # met à jour.
+    autonomous_scoring_interval_seconds: int = int(
+        os.getenv("MATCHING_AUTONOMOUS_SCORING_INTERVAL_SECONDS", "300")
+    )
+    # Offres rescorées en parallèle -- VPS à 4 vCPU partagé avec d'autres
+    # stacks (voir reindex_download_workers ci-dessus) ; chaque offre est
+    # nettement plus coûteuse qu'un simple téléchargement de CV (retrieve +
+    # cross-encoder rerank), d'où un pool plus restreint.
+    autonomous_scoring_workers: int = int(os.getenv("MATCHING_AUTONOMOUS_SCORING_WORKERS", "3"))
+    # Marge de sécurité sur le filtre modified_since du passage incrémental
+    # -- couvre le décalage d'horloge WP/matching-api et la latence entre
+    # l'écriture d'un CV et sa visibilité dans last_modified.
+    autonomous_scoring_cv_watermark_overlap_seconds: int = int(
+        os.getenv("MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS", "600")
+    )
 
 
 settings = Settings()
@@ -163,6 +187,28 @@ _reindex_status: dict = {
     "skipped": 0,
     "errors": 0,
     "total_seen": 0,
+    "last_error": None,
+}
+# Passages de réindexation incrémentaux (voir run_autonomous_scoring_cycle)
+# -- lock/état séparés de _reindex_lock/_reindex_status ci-dessus pour ne
+# pas polluer /admin/reindex-cvs/status (backfill complet, manuel ou au
+# démarrage) avec des cycles automatiques qui tournent toutes les
+# quelques minutes.
+_incremental_reindex_lock = Lock()
+_incremental_reindex_status: dict = dict(_reindex_status)
+_autonomous_executor = ThreadPoolExecutor(max_workers=max(1, settings.autonomous_scoring_workers))
+_jobs_in_flight_lock = Lock()
+_jobs_in_flight: set = set()
+_autonomous_status: dict = {
+    "enabled": settings.autonomous_scoring_enabled,
+    "running_cycle": False,
+    "last_cycle_started_at": None,
+    "last_cycle_finished_at": None,
+    "next_cycle_at": None,
+    "jobs_seen": 0,
+    "jobs_rescored_last_cycle": 0,
+    "jobs_in_flight": 0,
+    "errors": 0,
     "last_error": None,
 }
 
@@ -237,6 +283,25 @@ def resume_reindex_on_startup() -> None:
     logging.info("Reprise automatique du reindex CV déclenchée au démarrage")
 
 
+@app.on_event("startup")
+def start_autonomous_scoring_loop() -> None:
+    """Remplace le bouton "Lancer IA" par une boucle de fond : plus besoin
+    d'un clic humain ni d'une republication d'offre pour qu'un nouveau CV
+    pertinent apparaisse dans le classement d'une offre déjà scorée. Voir
+    run_autonomous_scoring_cycle() -- même patron thread daemon que
+    resume_reindex_on_startup() ci-dessus."""
+    if not settings.autonomous_scoring_enabled:
+        return
+    if not _pgvector_ready:
+        return
+    Thread(target=autonomous_scoring_loop, daemon=True).start()
+    logging.info(
+        "Boucle de scoring autonome démarrée (intervalle=%ss, workers=%s)",
+        settings.autonomous_scoring_interval_seconds,
+        settings.autonomous_scoring_workers,
+    )
+
+
 class JobPayload(BaseModel):
     id: int
     title: str
@@ -304,6 +369,19 @@ class ReindexStatus(BaseModel):
     skipped: int
     errors: int
     total_seen: int
+    last_error: Optional[str] = None
+
+
+class AutonomousScoringStatus(BaseModel):
+    enabled: bool
+    running_cycle: bool
+    last_cycle_started_at: Optional[float] = None
+    last_cycle_finished_at: Optional[float] = None
+    next_cycle_at: Optional[float] = None
+    jobs_seen: int
+    jobs_rescored_last_cycle: int
+    jobs_in_flight: int
+    errors: int
     last_error: Optional[str] = None
 
 
@@ -674,22 +752,107 @@ def embedding_text(value: str, kind: str) -> str:
     return f"{prefix}{value}"
 
 
-def fetch_wp_resumes_page(offset: int, limit: int) -> List[dict]:
-    """Une page de /keoni/v1/cvs côté keoni-bridge, sans filtre -- utilisé
-    par la réindexation complète pour parcourir tout le vivier de CV."""
+def fetch_wp_resumes_page(offset: int, limit: int, modified_since: Optional[str] = None) -> List[dict]:
+    """Une page de /keoni/v1/cvs côté keoni-bridge -- utilisé par la
+    réindexation pour parcourir le vivier de CV. `modified_since` (chaîne
+    "Y-m-d H:i:s" UTC) restreint aux CV modifiés depuis ce timestamp --
+    utilisé par les passages incrémentaux du scoring autonome pour ne pas
+    retélécharger tout le vivier à chaque cycle (voir run_full_reindex)."""
     if not settings.wp_api_base_url or not settings.wp_api_key:
         raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    params: dict = {"offset": offset, "limit": limit}
+    if modified_since:
+        params["modified_since"] = modified_since
 
     url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/cvs"
     response = requests.get(
         url,
-        params={"offset": offset, "limit": limit},
+        params=params,
         headers={"X-API-Key": settings.wp_api_key},
         timeout=30,
     )
     response.raise_for_status()
     items = response.json().get("items")
     return items if isinstance(items, list) else []
+
+
+def fetch_wp_active_jobs() -> List[dict]:
+    """Offres actives côté keoni-bridge (GET /keoni/v1/jobs) -- utilisé par
+    le scoring autonome pour détecter lui-même une offre nouvelle ou
+    modifiée, sans dépendre du webhook publish_post/du cron WP existants.
+    67 offres aujourd'hui : une seule page suffit largement (limite
+    serveur 1000), pas de pagination nécessaire dans l'immédiat."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/jobs"
+    response = requests.get(
+        url,
+        params={"offset": 0, "limit": 1000},
+        headers={"X-API-Key": settings.wp_api_key},
+        timeout=30,
+    )
+    response.raise_for_status()
+    items = response.json().get("items")
+    return items if isinstance(items, list) else []
+
+
+def fetch_wp_job(job_id: int) -> Optional["JobPayload"]:
+    """Fiche complète d'une offre (GET /keoni/v1/job/{id}), convertie en
+    JobPayload -- même mapping de champs que ce que n8n envoie aujourd'hui
+    à /score (Normalize Job), pour ne pas diverger du format déjà validé
+    en prod."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- récupération WordPress indisponible")
+
+    url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/job/{job_id}"
+    response = requests.get(url, headers={"X-API-Key": settings.wp_api_key}, timeout=30)
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    data = response.json()
+    # GET /job/{id} n'a pas de champ "description" séparé -- content/excerpt
+    # dérivent tous deux de la même colonne WP (voir get_job() côté
+    # keoni-bridge) ; laisser description vide plutôt que dupliquer content
+    # dedans, sinon prepare_job() concatène deux fois le même texte.
+    return JobPayload(
+        id=int(data.get("id") or job_id),
+        title=data.get("title") or "",
+        content=data.get("content") or "",
+        excerpt=data.get("excerpt") or "",
+        keywords=data.get("keywords"),
+        location=data.get("location"),
+        meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
+    )
+
+
+def push_matching_results(job_id: int, response: "ScoreResponse") -> None:
+    """Écrit un résultat de scoring dans WordPress -- mêmes trois appels
+    que ceux qu'effectue le workflow n8n existant (Store Results + Store
+    Final KPI), directement en HTTP par clé API : purge d'abord (sinon un
+    candidat absent du nouveau run resterait affiché indéfiniment, voir
+    ajax_run_matching côté keoni-bridge), puis écrit les résultats, puis
+    le KPI qui signale la fin du run au frontend (get_workflow_kpi)."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        raise RuntimeError("WP_API_BASE_URL/WP_API_KEY manquants -- écriture WordPress indisponible")
+
+    base = f"{settings.wp_api_base_url}/wp-json/keoni/v1"
+    headers = {"X-API-Key": settings.wp_api_key}
+
+    delete_resp = requests.delete(f"{base}/matching/{job_id}", headers=headers, timeout=30)
+    delete_resp.raise_for_status()
+
+    results_payload = {
+        "job_id": job_id,
+        "results": [item.model_dump() for item in response.results],
+    }
+    store_resp = requests.post(f"{base}/matching", headers=headers, json=results_payload, timeout=60)
+    store_resp.raise_for_status()
+
+    kpi_payload = {"job_id": job_id, "duration_ms": response.duration_ms}
+    kpi_resp = requests.post(f"{base}/matching-kpi", headers=headers, json=kpi_payload, timeout=30)
+    kpi_resp.raise_for_status()
 
 
 def fetch_wp_resumes_by_ids(ids: Sequence[int]) -> List[dict]:
@@ -949,14 +1112,27 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
             _reindex_status["updated"] += 1
 
 
-def run_full_reindex(max_total: Optional[int] = None) -> None:
+def run_full_reindex(
+    max_total: Optional[int] = None,
+    modified_since: Optional[str] = None,
+    *,
+    lock: Lock = _reindex_lock,
+    status: dict = _reindex_status,
+) -> None:
     """`max_total` borne le nombre de CV traités -- utilisé pour valider
     l'extraction sur un échantillon avant de lancer tout le vivier (voir
-    /admin/reindex-cvs?limit=N). None = tout le vivier, sans limite."""
-    with _reindex_lock:
-        if _reindex_status["running"]:
+    /admin/reindex-cvs?limit=N). None = tout le vivier, sans limite.
+
+    `modified_since`/`lock`/`status` : passages incrémentaux du scoring
+    autonome (run_autonomous_scoring_cycle) -- même boucle de pagination,
+    mais restreinte aux CV récemment modifiés et avec son propre
+    lock/état (_incremental_reindex_lock/_incremental_reindex_status) pour
+    ne pas se confondre avec un backfill complet manuel/au démarrage ni
+    polluer /admin/reindex-cvs/status."""
+    with lock:
+        if status["running"]:
             return
-        _reindex_status.update(
+        status.update(
             running=True,
             started_at=time.time(),
             finished_at=None,
@@ -976,7 +1152,7 @@ def run_full_reindex(max_total: Optional[int] = None) -> None:
                 page_size = min(page_size, max_total - offset)
 
             try:
-                resumes = fetch_wp_resumes_page(offset, page_size)
+                resumes = fetch_wp_resumes_page(offset, page_size, modified_since=modified_since)
             except Exception as exc:  # noqa: BLE001
                 # Une erreur transitoire (timeout WP, etc.) sur une seule
                 # page ne doit pas avorter tout le reste du vivier --
@@ -987,31 +1163,225 @@ def run_full_reindex(max_total: Optional[int] = None) -> None:
                 # continue : elle sera reprise au prochain passage complet
                 # (idempotent, content_hash), pas perdue pour de bon.
                 logging.warning("Réindexation: page offset=%s illisible, page sautée: %s", offset, exc)
-                _reindex_status["errors"] += 1
-                _reindex_status["last_error"] = str(exc)
+                status["errors"] += 1
+                status["last_error"] = str(exc)
                 offset += page_size
                 continue
 
             if not resumes:
                 break
 
-            _reindex_status["total_seen"] += len(resumes)
+            status["total_seen"] += len(resumes)
 
             try:
                 reindex_cv_batch(resumes)
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Réindexation: lot offset=%s échoué: %s", offset, exc)
-                _reindex_status["errors"] += 1
-                _reindex_status["last_error"] = str(exc)
+                status["errors"] += 1
+                status["last_error"] = str(exc)
 
-            _reindex_status["processed"] += len(resumes)
+            status["processed"] += len(resumes)
 
             if len(resumes) < page_size:
                 break
             offset += page_size
     finally:
-        _reindex_status["running"] = False
-        _reindex_status["finished_at"] = time.time()
+        status["running"] = False
+        status["finished_at"] = time.time()
+
+
+def get_cv_pool_version() -> Optional[datetime]:
+    """Horodatage le plus récent parmi les CV indexés (cv_embeddings.updated_at)
+    -- sert à la fois de filigrane pour le passage de réindexation
+    incrémental (voir run_autonomous_scoring_cycle) et de "version du
+    vivier" comparée à JobScoringState.last_scored_cv_pool_version pour
+    savoir si une offre a besoin d'être rescorée même quand elle n'a pas
+    elle-même changé."""
+    engine = get_engine()
+    if engine is None:
+        return None
+    with engine.begin() as conn:
+        return conn.execute(select(func.max(CvEmbedding.updated_at))).scalar()
+
+
+def _as_aware_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def job_needs_rescore(conn, job_id: int, wp_updated_at: str, pool_version: Optional[datetime]) -> bool:
+    row = conn.execute(
+        select(
+            JobScoringState.last_scored_job_modified,
+            JobScoringState.last_scored_cv_pool_version,
+        ).where(JobScoringState.job_id == job_id)
+    ).first()
+
+    if row is None:
+        return True
+    if (wp_updated_at or "") != (row.last_scored_job_modified or ""):
+        return True
+
+    last_pool = _as_aware_utc(row.last_scored_cv_pool_version)
+    pool_version = _as_aware_utc(pool_version)
+    if last_pool is None or pool_version is None:
+        return True
+    return pool_version > last_pool
+
+
+def upsert_job_scoring_state(job_id: int, wp_updated_at: str, pool_version: datetime) -> None:
+    engine = get_engine()
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        stmt = pg_insert(JobScoringState).values(
+            job_id=job_id,
+            last_scored_job_modified=wp_updated_at or "",
+            last_scored_cv_pool_version=pool_version,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[JobScoringState.job_id],
+            set_={
+                "last_scored_job_modified": stmt.excluded.last_scored_job_modified,
+                "last_scored_cv_pool_version": stmt.excluded.last_scored_cv_pool_version,
+                "last_scored_at": func.now(),
+            },
+        )
+        conn.execute(stmt)
+
+
+def score_job_autonomously(job_id: int, wp_updated_at: str, pool_version: datetime) -> None:
+    """Pipeline complet pour une offre, exécuté par le pool de workers du
+    scoring autonome -- mêmes étapes que ce que fait déjà n8n pour "Lancer
+    IA" (fetch job, /retrieve, /score, écriture des résultats), mais
+    `retrieve()`/`score()` appelées directement en interne (fonctions
+    Python pures, voir leur définition plus bas) plutôt qu'en repassant
+    par HTTP sur soi-même."""
+    try:
+        job = fetch_wp_job(job_id)
+        if job is None:
+            logging.info("Scoring autonome: offre %s introuvable, ignorée", job_id)
+            return
+
+        retrieve_result = retrieve(RetrieveRequest(job=job), None)
+        cvs = retrieve_result.get("cvs") or []
+        if not cvs:
+            logging.info("Scoring autonome: offre %s sans candidat retenu par /retrieve", job_id)
+            return
+
+        # resume_to_cv_payload() (pas CvPayload(**cv) direct) : les CV
+        # renvoyés par /retrieve sont au format WP brut (normalize_resume()
+        # côté keoni-bridge, champ "email" p.ex.) -- c'est n8n qui fait
+        # aujourd'hui ce renommage ("Normalize CV Fast") avant d'appeler
+        # /score ; ici on appelle score() en interne, donc c'est cette
+        # fonction qui doit s'en charger, comme le fait déjà reindex_cv_text().
+        response = score(ScoreRequest(job=job, cvs=[resume_to_cv_payload(cv) for cv in cvs]), None)
+        push_matching_results(job_id, response)
+        upsert_job_scoring_state(job_id, wp_updated_at, pool_version)
+
+        with _jobs_in_flight_lock:
+            _autonomous_status["jobs_rescored_last_cycle"] += 1
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Scoring autonome: offre %s échouée: %s", job_id, exc)
+        with _jobs_in_flight_lock:
+            _autonomous_status["errors"] += 1
+            _autonomous_status["last_error"] = f"job {job_id}: {exc}"
+    finally:
+        with _jobs_in_flight_lock:
+            _jobs_in_flight.discard(job_id)
+            _autonomous_status["jobs_in_flight"] = len(_jobs_in_flight)
+
+
+def run_autonomous_scoring_cycle() -> None:
+    """Un cycle : (1) réindexation CV incrémentale (seulement ce qui a
+    changé depuis le dernier cycle, voir run_full_reindex/modified_since)
+    pour que le vivier soit frais avant de décider quelles offres
+    rescorer ; (2) liste des offres actives côté WordPress ; (3) pour
+    chacune, comparaison à JobScoringState pour savoir si elle a besoin
+    d'être rescorée ; (4) dispatch des offres concernées (pas déjà en vol)
+    sur le pool de workers borné -- traitement réellement parallèle,
+    continu, sans attendre la fin d'un cycle pour absorber le suivant."""
+    if not _pgvector_ready:
+        return
+
+    _autonomous_status["running_cycle"] = True
+    _autonomous_status["last_cycle_started_at"] = time.time()
+
+    try:
+        overlap = timedelta(seconds=settings.autonomous_scoring_cv_watermark_overlap_seconds)
+        watermark = get_cv_pool_version()
+        modified_since = None
+        if watermark is not None:
+            modified_since = (watermark - overlap).strftime("%Y-%m-%d %H:%M:%S")
+
+        run_full_reindex(
+            modified_since=modified_since,
+            lock=_incremental_reindex_lock,
+            status=_incremental_reindex_status,
+        )
+
+        pool_version = get_cv_pool_version()
+
+        try:
+            jobs = fetch_wp_active_jobs()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Scoring autonome: liste des offres illisible: %s", exc)
+            _autonomous_status["errors"] += 1
+            _autonomous_status["last_error"] = str(exc)
+            return
+
+        _autonomous_status["jobs_seen"] = len(jobs)
+        _autonomous_status["jobs_rescored_last_cycle"] = 0
+
+        engine = get_engine()
+        if engine is None:
+            return
+
+        with engine.begin() as conn:
+            to_dispatch = []
+            for job_summary in jobs:
+                job_id = job_summary.get("id")
+                if not isinstance(job_id, int):
+                    continue
+                wp_updated_at = str(job_summary.get("updated_at") or "")
+
+                with _jobs_in_flight_lock:
+                    if job_id in _jobs_in_flight:
+                        continue
+
+                if not job_needs_rescore(conn, job_id, wp_updated_at, pool_version):
+                    continue
+
+                to_dispatch.append((job_id, wp_updated_at))
+
+        for job_id, wp_updated_at in to_dispatch:
+            with _jobs_in_flight_lock:
+                if job_id in _jobs_in_flight:
+                    continue
+                _jobs_in_flight.add(job_id)
+                _autonomous_status["jobs_in_flight"] = len(_jobs_in_flight)
+            _autonomous_executor.submit(score_job_autonomously, job_id, wp_updated_at, pool_version)
+    finally:
+        _autonomous_status["running_cycle"] = False
+        _autonomous_status["last_cycle_finished_at"] = time.time()
+        _autonomous_status["next_cycle_at"] = time.time() + settings.autonomous_scoring_interval_seconds
+
+
+def autonomous_scoring_loop() -> None:
+    while True:
+        try:
+            run_autonomous_scoring_cycle()
+        except Exception as exc:  # noqa: BLE001
+            # Un cycle en échec (WP injoignable, DB down, etc.) ne doit
+            # jamais arrêter la boucle -- même philosophie que
+            # run_full_reindex : on réessaiera au cycle suivant.
+            logging.warning("Scoring autonome: cycle échoué: %s", exc)
+            _autonomous_status["errors"] += 1
+            _autonomous_status["last_error"] = str(exc)
+        time.sleep(settings.autonomous_scoring_interval_seconds)
 
 
 def get_cross_encoder() -> Optional[CrossEncoder]:
@@ -1845,6 +2215,14 @@ def start_reindex_cvs(
 @app.get("/admin/reindex-cvs/status", response_model=ReindexStatus)
 def get_reindex_status(_: None = Depends(require_api_key)) -> ReindexStatus:
     return ReindexStatus(**_reindex_status)
+
+
+@app.get("/admin/autonomous-scoring/status", response_model=AutonomousScoringStatus)
+def get_autonomous_scoring_status(_: None = Depends(require_api_key)) -> AutonomousScoringStatus:
+    """Suivi de la boucle de scoring autonome (voir run_autonomous_scoring_cycle) --
+    même esprit que /admin/reindex-cvs/status : offres vues/rescorées au
+    dernier cycle, offres actuellement en cours de scoring, erreurs."""
+    return AutonomousScoringStatus(**_autonomous_status)
 
 
 @app.post("/retrieve")
