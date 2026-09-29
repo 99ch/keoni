@@ -52,13 +52,6 @@ class CvEmbedding(Base):
     __tablename__ = "cv_embeddings"
     __table_args__ = (
         UniqueConstraint("cv_id", name="ux_cv_embeddings_cv_id"),
-        Index(
-            "ix_cv_embeddings_vector",
-            "embedding",
-            postgresql_using="ivfflat",
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-            postgresql_with={"lists": "100"},
-        ),
         # Index GIN pour le canal de récupération "exact" (chevauchement de
         # compétences canoniques ROME, opérateur `&&`) qui complète la
         # recherche vectorielle -- voir /retrieve dans main.py.
@@ -68,7 +61,12 @@ class CvEmbedding(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cv_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    # Le vecteur d'embedding lui-même vit dans CvEmbeddingChunk (voir
+    # plus bas) : un seul embedding pour tout le texte d'un CV le
+    # tronquait silencieusement à la limite interne du modèle (512
+    # tokens pour intfloat/multilingual-e5-base, ~350-400 mots) sur les
+    # CV longs -- même problème que cross_encode_best() a déjà résolu
+    # pour le rerank en découpant en fenêtres (voir chunk_text()).
     # Libellés canoniques (taxonomie ROME, voir app/taxonomy.py::find_skills)
     # détectés dans le texte du CV au moment de l'indexation -- alimente le
     # canal de récupération "exact" en complément du canal sémantique.
@@ -86,3 +84,30 @@ class CvEmbedding(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class CvEmbeddingChunk(Base):
+    """Un embedding par fenêtre de texte (voir chunk_text() dans main.py),
+    pas un seul embedding par CV entier -- pour qu'un CV long ne soit pas
+    silencieusement tronqué à la limite interne du modèle (voir le
+    commentaire sur CvEmbedding ci-dessus). La recherche vectorielle
+    (/retrieve, rank_with_pgvector) regroupe par cv_id et prend la
+    distance minimale : un candidat est classé sur sa meilleure fenêtre,
+    jamais une moyenne qui diluerait un match localisé."""
+
+    __tablename__ = "cv_embedding_chunks"
+    __table_args__ = (
+        UniqueConstraint("cv_id", "chunk_index", name="ux_cv_embedding_chunks_cv_id_chunk_index"),
+        Index(
+            "ix_cv_embedding_chunks_vector",
+            "embedding",
+            postgresql_using="ivfflat",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"lists": "100"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cv_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)

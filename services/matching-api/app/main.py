@@ -26,12 +26,12 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, st
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import extraction
 from app.db import get_engine, init_db
-from app.models import CvEmbedding, JobEmbedding
+from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding
 from app.scoring import (
     DEFAULT_WEIGHTS,
     PreparedCv,
@@ -880,13 +880,28 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
         if not to_embed:
             return
 
-        vectors = encode_texts([embedding_text(text_value, "passage") for _, text_value in to_embed])
-        for (cv_id, text_value), vector in zip(to_embed, vectors):
+        # Un embedding par fenêtre de texte (chunk_text(), même découpage que
+        # cross_encode_best()), pas un seul par CV entier -- sinon un CV long
+        # est tronqué en silence à la limite interne du modèle (512 tokens
+        # pour intfloat/multilingual-e5-base). Un seul appel encode_texts()
+        # sur l'ensemble des fenêtres de tout le batch, comme avant.
+        chunk_refs: List[Tuple[int, int]] = []
+        flattened_texts: List[str] = []
+        for cv_id, text_value in to_embed:
+            for chunk_index, chunk in enumerate(chunk_text(text_value)):
+                chunk_refs.append((cv_id, chunk_index))
+                flattened_texts.append(embedding_text(chunk, "passage"))
+
+        vectors = encode_texts(flattened_texts)
+        chunks_by_cv: dict[int, List[Tuple[int, list]]] = {}
+        for (cv_id, chunk_index), vector in zip(chunk_refs, vectors):
+            chunks_by_cv.setdefault(cv_id, []).append((chunk_index, vector.tolist()))
+
+        for cv_id, text_value in to_embed:
             skills = sorted(find_skills(text_value))
             stmt = pg_insert(CvEmbedding).values(
                 cv_id=cv_id,
                 content_hash=content_hash(text_value),
-                embedding=vector.tolist(),
                 skills_canonical=skills,
                 text_content=text_value,
             )
@@ -894,13 +909,24 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                 index_elements=[CvEmbedding.cv_id],
                 set_={
                     "content_hash": stmt.excluded.content_hash,
-                    "embedding": stmt.excluded.embedding,
                     "skills_canonical": stmt.excluded.skills_canonical,
                     "text_content": stmt.excluded.text_content,
                     "updated_at": func.now(),
                 },
             )
             conn.execute(stmt)
+
+            # DELETE puis réinsertion plutôt qu'un ON CONFLICT : le nombre de
+            # fenêtres peut changer d'un passage à l'autre (CV raccourci),
+            # un simple upsert laisserait des chunks orphelins en trop.
+            conn.execute(delete(CvEmbeddingChunk).where(CvEmbeddingChunk.cv_id == cv_id))
+            conn.execute(
+                pg_insert(CvEmbeddingChunk),
+                [
+                    {"cv_id": cv_id, "chunk_index": chunk_index, "embedding": vector}
+                    for chunk_index, vector in chunks_by_cv.get(cv_id, [])
+                ],
+            )
             _reindex_status["updated"] += 1
 
 
@@ -1250,27 +1276,50 @@ def rank_with_pgvector(
             stale_ids = [cv_id for cv_id in cv_ids if existing_hashes.get(cv_id) != cv_hashes[cv_id]]
 
             if stale_ids:
-                vectors = encode_texts([embedding_text(candidates_by_id[cv_id].text, "passage") for cv_id in stale_ids])
-                for i, cv_id in enumerate(stale_ids):
-                    cv_stmt = pg_insert(CvEmbedding).values(
-                        cv_id=cv_id, content_hash=cv_hashes[cv_id], embedding=vectors[i].tolist()
-                    )
+                # Un embedding par fenêtre (chunk_text()), pas un seul par CV
+                # entier -- voir le même changement dans reindex_cv_batch().
+                chunk_refs: List[Tuple[int, int]] = []
+                flattened_texts: List[str] = []
+                for cv_id in stale_ids:
+                    for chunk_index, chunk in enumerate(chunk_text(candidates_by_id[cv_id].text)):
+                        chunk_refs.append((cv_id, chunk_index))
+                        flattened_texts.append(embedding_text(chunk, "passage"))
+
+                vectors = encode_texts(flattened_texts)
+                chunks_by_cv: dict[int, List[Tuple[int, list]]] = {}
+                for (cv_id, chunk_index), vector in zip(chunk_refs, vectors):
+                    chunks_by_cv.setdefault(cv_id, []).append((chunk_index, vector.tolist()))
+
+                for cv_id in stale_ids:
+                    cv_stmt = pg_insert(CvEmbedding).values(cv_id=cv_id, content_hash=cv_hashes[cv_id])
                     cv_stmt = cv_stmt.on_conflict_do_update(
                         index_elements=[CvEmbedding.cv_id],
                         set_={
                             "content_hash": cv_stmt.excluded.content_hash,
-                            "embedding": cv_stmt.excluded.embedding,
                             "updated_at": func.now(),
                         },
                     )
                     conn.execute(cv_stmt)
 
-            distance = CvEmbedding.embedding.cosine_distance(job_vector.tolist()).label("distance")
+                    conn.execute(delete(CvEmbeddingChunk).where(CvEmbeddingChunk.cv_id == cv_id))
+                    conn.execute(
+                        pg_insert(CvEmbeddingChunk),
+                        [
+                            {"cv_id": cv_id, "chunk_index": chunk_index, "embedding": vector}
+                            for chunk_index, vector in chunks_by_cv.get(cv_id, [])
+                        ],
+                    )
+
+            # Classement sur la meilleure fenêtre de chaque candidat (MIN),
+            # jamais une moyenne qui diluerait un match localisé -- même
+            # logique que cross_encode_best() pour le rerank.
+            min_distance = func.min(CvEmbeddingChunk.embedding.cosine_distance(job_vector.tolist())).label("distance")
             limit = max(1, min(top_k, len(cv_ids)))
             rows = conn.execute(
-                select(CvEmbedding.cv_id, distance)
-                .where(CvEmbedding.cv_id.in_(cv_ids))
-                .order_by(distance.asc())
+                select(CvEmbeddingChunk.cv_id, min_distance)
+                .where(CvEmbeddingChunk.cv_id.in_(cv_ids))
+                .group_by(CvEmbeddingChunk.cv_id)
+                .order_by(min_distance.asc())
                 .limit(limit)
             ).all()
 
@@ -1777,9 +1826,14 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     with engine.begin() as conn:
         conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
 
-        distance = CvEmbedding.embedding.cosine_distance(job_vector.tolist()).label("distance")
+        # Classement sur la meilleure fenêtre de chaque CV (MIN), pas une
+        # moyenne -- voir le commentaire sur CvEmbeddingChunk (models.py).
+        min_distance = func.min(CvEmbeddingChunk.embedding.cosine_distance(job_vector.tolist())).label("distance")
         semantic_rows = conn.execute(
-            select(CvEmbedding.cv_id).order_by(distance.asc()).limit(payload.limit)
+            select(CvEmbeddingChunk.cv_id, min_distance)
+            .group_by(CvEmbeddingChunk.cv_id)
+            .order_by(min_distance.asc())
+            .limit(payload.limit)
         ).all()
         semantic_ids = [row.cv_id for row in semantic_rows]
 
