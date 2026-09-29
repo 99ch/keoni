@@ -26,12 +26,12 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, st
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 from sentence_transformers import CrossEncoder, SentenceTransformer
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import delete, func, select, text, union_all, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import extraction
 from app.db import get_engine, init_db
-from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding
+from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk
 from app.scoring import (
     DEFAULT_WEIGHTS,
     PreparedCv,
@@ -1059,6 +1059,30 @@ def chunk_text(value: str, max_chars: int = 800, max_chunks: int = 8) -> List[st
     return chunks[:max_chunks] or [""]
 
 
+def find_cv_ids_by_job_chunks(conn, job_chunk_vectors, limit: int, cv_ids: Optional[List[int]] = None):
+    """Union de toutes les paires (fenêtre d'offre x fenêtre de CV),
+    regroupée par cv_id avec la distance MINIMALE -- la meilleure fenêtre
+    gagne, jamais une moyenne (même principe que cross_encode_best()).
+    job_chunk_vectors : embeddings déjà calculés (un par fenêtre d'offre),
+    pas de recalcul ici."""
+    subqueries = [
+        select(
+            CvEmbeddingChunk.cv_id,
+            CvEmbeddingChunk.embedding.cosine_distance(
+                vector.tolist() if hasattr(vector, "tolist") else vector
+            ).label("distance"),
+        )
+        for vector in job_chunk_vectors
+    ]
+    unioned = union_all(*subqueries).subquery()
+    min_distance = func.min(unioned.c.distance).label("distance")
+    query = select(unioned.c.cv_id, min_distance).group_by(unioned.c.cv_id)
+    if cv_ids is not None:
+        query = query.where(unioned.c.cv_id.in_(cv_ids))
+    query = query.order_by(min_distance.asc()).limit(limit)
+    return conn.execute(query).all()
+
+
 def cross_encode_best(query: str, document: str) -> float:
     """Score sémantique fin d'une paire (offre, CV), 0-1 (sigmoïde du logit brut).
 
@@ -1248,25 +1272,45 @@ def rank_with_pgvector(
         with engine.begin() as conn:
             job_text_hash = content_hash(job.text)
             existing_job = conn.execute(
-                select(JobEmbedding.content_hash, JobEmbedding.embedding).where(JobEmbedding.job_id == job_id)
+                select(JobEmbedding.content_hash).where(JobEmbedding.job_id == job_id)
             ).first()
 
-            if existing_job and existing_job.content_hash == job_text_hash:
-                job_vector = np.asarray(existing_job.embedding, dtype="float32")
-            else:
-                job_vector = encode_texts([embedding_text(job.text, "query")])[0]
-                job_stmt = pg_insert(JobEmbedding).values(
-                    job_id=job_id, content_hash=job_text_hash, embedding=job_vector.tolist()
-                )
+            if not (existing_job and existing_job.content_hash == job_text_hash):
+                # Un embedding par fenêtre (chunk_text()), pas un seul pour
+                # toute l'offre -- une offre longue (plusieurs sections
+                # concaténées par prepare_job()) tronquait sinon en silence
+                # le vecteur de requête utilisé pour la recherche initiale.
+                job_chunks = chunk_text(job.text)
+                job_chunk_vectors = encode_texts([embedding_text(c, "query") for c in job_chunks])
+
+                job_stmt = pg_insert(JobEmbedding).values(job_id=job_id, content_hash=job_text_hash)
                 job_stmt = job_stmt.on_conflict_do_update(
                     index_elements=[JobEmbedding.job_id],
                     set_={
                         "content_hash": job_stmt.excluded.content_hash,
-                        "embedding": job_stmt.excluded.embedding,
                         "updated_at": func.now(),
                     },
                 )
                 conn.execute(job_stmt)
+
+                conn.execute(delete(JobEmbeddingChunk).where(JobEmbeddingChunk.job_id == job_id))
+                conn.execute(
+                    pg_insert(JobEmbeddingChunk),
+                    [
+                        {"job_id": job_id, "chunk_index": i, "embedding": vector.tolist()}
+                        for i, vector in enumerate(job_chunk_vectors)
+                    ],
+                )
+
+            # Relu depuis JobEmbeddingChunk (que l'offre vienne d'être
+            # recalculée ou était déjà en cache) : source unique de vérité,
+            # pas de variable Python à faire persister entre les deux cas.
+            job_chunk_vectors = [
+                row.embedding
+                for row in conn.execute(
+                    select(JobEmbeddingChunk.embedding).where(JobEmbeddingChunk.job_id == job_id)
+                ).all()
+            ]
 
             existing_rows = conn.execute(
                 select(CvEmbedding.cv_id, CvEmbedding.content_hash).where(CvEmbedding.cv_id.in_(cv_ids))
@@ -1310,18 +1354,11 @@ def rank_with_pgvector(
                         ],
                     )
 
-            # Classement sur la meilleure fenêtre de chaque candidat (MIN),
-            # jamais une moyenne qui diluerait un match localisé -- même
-            # logique que cross_encode_best() pour le rerank.
-            min_distance = func.min(CvEmbeddingChunk.embedding.cosine_distance(job_vector.tolist())).label("distance")
+            # Classement sur la meilleure paire (fenêtre d'offre, fenêtre de
+            # CV) -- jamais une moyenne qui diluerait un match localisé,
+            # même logique que cross_encode_best() pour le rerank.
             limit = max(1, min(top_k, len(cv_ids)))
-            rows = conn.execute(
-                select(CvEmbeddingChunk.cv_id, min_distance)
-                .where(CvEmbeddingChunk.cv_id.in_(cv_ids))
-                .group_by(CvEmbeddingChunk.cv_id)
-                .order_by(min_distance.asc())
-                .limit(limit)
-            ).all()
+            rows = find_cv_ids_by_job_chunks(conn, job_chunk_vectors, limit, cv_ids=cv_ids)
 
         return [
             (candidates_by_id[row.cv_id], max(0.0, 1.0 - float(row.distance)))
@@ -1819,22 +1856,20 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     if not prepared_job.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
 
-    job_vector = encode_texts([embedding_text(prepared_job.text, "query")])[0]
+    # Un embedding par fenêtre de texte d'offre, pas un seul pour toute
+    # l'offre -- voir le commentaire sur JobEmbeddingChunk (models.py).
+    job_chunk_vectors = encode_texts(
+        [embedding_text(c, "query") for c in chunk_text(prepared_job.text)]
+    )
     required_skills = sorted(prepared_job.skills_canonical)
     title_ids = fetch_wp_resume_ids_by_title(job.title or "")
 
     with engine.begin() as conn:
         conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
 
-        # Classement sur la meilleure fenêtre de chaque CV (MIN), pas une
-        # moyenne -- voir le commentaire sur CvEmbeddingChunk (models.py).
-        min_distance = func.min(CvEmbeddingChunk.embedding.cosine_distance(job_vector.tolist())).label("distance")
-        semantic_rows = conn.execute(
-            select(CvEmbeddingChunk.cv_id, min_distance)
-            .group_by(CvEmbeddingChunk.cv_id)
-            .order_by(min_distance.asc())
-            .limit(payload.limit)
-        ).all()
+        # Classement sur la meilleure paire (fenêtre d'offre, fenêtre de
+        # CV) -- jamais une moyenne, voir find_cv_ids_by_job_chunks().
+        semantic_rows = find_cv_ids_by_job_chunks(conn, job_chunk_vectors, payload.limit)
         semantic_ids = [row.cv_id for row in semantic_rows]
 
         taxonomy_ids: List[int] = []
