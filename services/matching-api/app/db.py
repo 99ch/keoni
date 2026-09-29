@@ -93,6 +93,13 @@ def init_db() -> bool:
                     "ADD COLUMN IF NOT EXISTS text_content TEXT NOT NULL DEFAULT ''"
                 )
             )
+            # L'embedding par CV entier vit désormais dans cv_embedding_chunks
+            # (table neuve, créée ci-dessus par create_all()) -- cette colonne
+            # devient inutile et, étant NOT NULL sans défaut, bloquerait tout
+            # nouvel INSERT dès que le code arrête de la renseigner. Perte de
+            # données sans impact : les anciens vecteurs non découpés sont
+            # remplacés par des chunks au prochain passage de réindexation.
+            conn.execute(text("ALTER TABLE cv_embeddings DROP COLUMN IF EXISTS embedding"))
         return True
     except Exception as exc:  # noqa: BLE001
         logging.warning("Initialisation pgvector impossible, fallback FAISS: %s", exc)
