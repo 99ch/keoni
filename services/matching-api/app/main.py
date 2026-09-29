@@ -854,20 +854,39 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
     to_embed: List[Tuple[int, str]] = []
 
     with engine.begin() as conn:
+        cv_ids_in_batch = list(texts.keys())
+        existing_by_id = {
+            row.cv_id: row
+            for row in conn.execute(
+                select(CvEmbedding.cv_id, CvEmbedding.content_hash, CvEmbedding.text_content).where(
+                    CvEmbedding.cv_id.in_(cv_ids_in_batch)
+                )
+            ).all()
+        }
+        # CV déjà indexés AVANT l'introduction de cv_embedding_chunks (voir
+        # PR #14) : leur content_hash correspond toujours (texte inchangé)
+        # mais ils n'ont jamais eu de chunks écrits -- sans ce contrôle
+        # supplémentaire, "skipped" les laisserait invisibles au canal
+        # sémantique indéfiniment. Même raisonnement que le backfill de
+        # text_content juste en dessous, pour la même classe de problème.
+        cv_ids_with_chunks = {
+            row.cv_id
+            for row in conn.execute(
+                select(CvEmbeddingChunk.cv_id.distinct()).where(CvEmbeddingChunk.cv_id.in_(cv_ids_in_batch))
+            ).all()
+        }
+
         for cv_id, text_value in texts.items():
             new_hash = content_hash(text_value)
-            existing = conn.execute(
-                select(CvEmbedding.content_hash, CvEmbedding.text_content).where(
-                    CvEmbedding.cv_id == cv_id
-                )
-            ).first()
-            if existing and existing.content_hash == new_hash:
-                # Contenu inchangé depuis le dernier passage : pas besoin de
-                # recalculer l'embedding, mais si ce CV a été indexé avant
-                # l'ajout de text_content (colonne vide), on le comble à peu
-                # de frais -- un simple UPDATE, sans ré-encodage -- pour que
-                # /retrieve puisse déjà le servir en cache sans attendre un
-                # changement de contenu qui n'arrivera peut-être jamais.
+            existing = existing_by_id.get(cv_id)
+            if existing and existing.content_hash == new_hash and cv_id in cv_ids_with_chunks:
+                # Contenu inchangé depuis le dernier passage ET chunks déjà
+                # présents : pas besoin de recalculer l'embedding, mais si ce
+                # CV a été indexé avant l'ajout de text_content (colonne
+                # vide), on le comble à peu de frais -- un simple UPDATE,
+                # sans ré-encodage -- pour que /retrieve puisse déjà le
+                # servir en cache sans attendre un changement de contenu qui
+                # n'arrivera peut-être jamais.
                 if not existing.text_content:
                     conn.execute(
                         update(CvEmbedding).where(CvEmbedding.cv_id == cv_id).values(text_content=text_value)
@@ -1274,8 +1293,19 @@ def rank_with_pgvector(
             existing_job = conn.execute(
                 select(JobEmbedding.content_hash).where(JobEmbedding.job_id == job_id)
             ).first()
+            # Offres déjà scorées AVANT l'introduction de job_embedding_chunks
+            # (voir PR #15) : même contrôle que côté CV, sinon leur
+            # content_hash inchangé les fait "sauter" sans jamais avoir de
+            # chunks -- job_chunk_vectors resterait vide plus bas et
+            # find_cv_ids_by_job_chunks() planterait sur un UNION ALL vide.
+            has_job_chunks = (
+                conn.execute(
+                    select(JobEmbeddingChunk.id).where(JobEmbeddingChunk.job_id == job_id).limit(1)
+                ).first()
+                is not None
+            )
 
-            if not (existing_job and existing_job.content_hash == job_text_hash):
+            if not (existing_job and existing_job.content_hash == job_text_hash and has_job_chunks):
                 # Un embedding par fenêtre (chunk_text()), pas un seul pour
                 # toute l'offre -- une offre longue (plusieurs sections
                 # concaténées par prepare_job()) tronquait sinon en silence
