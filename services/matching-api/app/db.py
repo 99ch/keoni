@@ -100,6 +100,10 @@ def init_db() -> bool:
             # données sans impact : les anciens vecteurs non découpés sont
             # remplacés par des chunks au prochain passage de réindexation.
             conn.execute(text("ALTER TABLE cv_embeddings DROP COLUMN IF EXISTS embedding"))
+            # Meme raisonnement pour les offres (voir job_embedding_chunks,
+            # cree ci-dessus par create_all()) : une offre longue tronquait
+            # silencieusement son unique embedding de recherche.
+            conn.execute(text("ALTER TABLE job_embeddings DROP COLUMN IF EXISTS embedding"))
         return True
     except Exception as exc:  # noqa: BLE001
         logging.warning("Initialisation pgvector impossible, fallback FAISS: %s", exc)

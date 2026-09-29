@@ -24,14 +24,33 @@ class Base(DeclarativeBase):
 
 class JobEmbedding(Base):
     __tablename__ = "job_embeddings"
+    __table_args__ = (UniqueConstraint("job_id", name="ux_job_embeddings_job_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Le vecteur d'embedding vit dans JobEmbeddingChunk (voir plus bas) --
+    # même raison que pour CvEmbedding : une offre longue (plusieurs
+    # sections concaténées par prepare_job()) tronquait silencieusement
+    # l'unique embedding a la limite interne du modele (512 tokens).
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class JobEmbeddingChunk(Base):
+    """Un embedding par fenêtre de texte d'offre (voir chunk_text() dans
+    main.py), pas un seul par offre entière -- même principe que
+    CvEmbeddingChunk. La recherche vectorielle compare chaque fenêtre
+    d'offre à chaque fenêtre de CV et garde la distance minimale : la
+    meilleure paire de fenêtres gagne, jamais une moyenne qui diluerait un
+    match localisé (même logique que cross_encode_best() pour le rerank)."""
+
+    __tablename__ = "job_embedding_chunks"
     __table_args__ = (
-        UniqueConstraint("job_id", name="ux_job_embeddings_job_id"),
-        # Doit rester déclaré ici, pas seulement créé en SQL brut dans la
-        # migration : `alembic check` compare l'état réel de la base à ce
-        # que Base.metadata décrit, et un index présent en base mais absent
-        # d'ici est détecté comme une dérive (proposé à tort en suppression).
+        UniqueConstraint("job_id", "chunk_index", name="ux_job_embedding_chunks_job_id_chunk_index"),
         Index(
-            "ix_job_embeddings_vector",
+            "ix_job_embedding_chunks_vector",
             "embedding",
             postgresql_using="ivfflat",
             postgresql_ops={"embedding": "vector_cosine_ops"},
@@ -41,11 +60,8 @@ class JobEmbedding(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
-    )
 
 
 class CvEmbedding(Base):
