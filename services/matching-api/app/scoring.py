@@ -385,6 +385,19 @@ def infer_seniority_years(job: PreparedJob) -> int:
 
 _BULLET_PREFIX_RE = re.compile(r"^(?:[•◦‣▪·\-\*]|\(?\d+[.)])\s+")
 _KEYWORDS_HEADER_MARKERS = ("mots cle", "mot cle", "keyword")
+# Champ WYSIWYG WordPress saisi en liste (<ul><li>...</li></ul>) : les
+# limites de <li>/<br>/<p> doivent devenir des retours à la ligne AVANT le
+# retrait des balises (strip_html les remplace par un simple espace), sinon
+# plusieurs termes se retrouvent fusionnés en un seul bloc -- observé en
+# prod, un "<li>Certification DPO CNIL indispensable</li>" entier affiché
+# tel quel comme "mot-clé manquant", jamais matchable contre un CV.
+_HTML_BLOCK_BREAK_RE = re.compile(r"(?i)</?(?:li|ul|ol|br|p|div)\b[^>]*>")
+# Certains recruteurs saisissent leur liste sur une seule ligne, séparée par
+# " . " ou " · " plutôt que par une virgule (ex. observé en prod :
+# "Terraform . TOGAF"). Le point/point médian DOIT être entouré d'espaces
+# pour compter comme séparateur, afin de ne jamais couper un terme composé
+# du type "Node.js" (pas d'espace autour du point).
+_INLINE_KEYWORD_SEPARATOR_RE = re.compile(r"\s+[.·]\s+")
 
 
 def split_priority_keyword_terms(raw: Optional[Union[str, Sequence[str]]]) -> List[str]:
@@ -397,7 +410,10 @@ def split_priority_keyword_terms(raw: Optional[Union[str, Sequence[str]]]) -> Li
     if not raw:
         return []
     if isinstance(raw, str):
-        lines: Sequence[str] = re.split(r"[,;\n]+", raw)
+        normalized = _HTML_BLOCK_BREAK_RE.sub("\n", raw)
+        normalized = strip_html(normalized)
+        normalized = _INLINE_KEYWORD_SEPARATOR_RE.sub("\n", normalized)
+        lines: Sequence[str] = re.split(r"[,;\n]+", normalized)
     else:
         lines = list(raw)
 
