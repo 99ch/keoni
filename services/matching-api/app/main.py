@@ -362,13 +362,15 @@ class ScoreRequest(BaseModel):
 
 
 class ScoreFastRequest(BaseModel):
-    """Branche rapide ('Lancer IA') : seule l'offre est fournie, les
-    candidats sont retrouvés côté serveur par correspondance de titre
-    (voir fetch_wp_resume_ids_by_title) -- même canal que l'ancien noeud
-    n8n 'Fetch CV L1 Strict Title'. L'appelant n'a donc pas à récupérer et
-    envoyer lui-même la liste des CV, contrairement à /score."""
+    """Branche rapide ('Lancer IA') : seul job_id est fourni -- l'offre
+    elle-même est récupérée côté serveur via fetch_wp_job (même appel que
+    la boucle de scoring autonome), et les candidats par correspondance de
+    titre (voir fetch_wp_resume_ids_by_title, même canal que l'ancien
+    noeud n8n 'Fetch CV L1 Strict Title'). keoni-bridge n'a donc qu'à
+    transmettre l'id de l'offre, sans reconstruire un JobPayload complet
+    côté PHP."""
 
-    job: JobPayload
+    job_id: int
 
 
 class ScoreItem(BaseModel):
@@ -2452,17 +2454,21 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
 
 @app.post("/score-fast", response_model=ScoreResponse)
 def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
-    """Branche rapide : récupération des candidats par correspondance de
-    titre uniquement (pas de canal sémantique/taxonomie, pas de cross-
+    """Branche rapide : offre récupérée par id, candidats par correspondance
+    de titre uniquement (pas de canal sémantique/taxonomie, pas de cross-
     encoder) -- pensée pour un retour synchrone quasi instantané au clic
     sur 'Lancer IA', pendant que le scoring complet continue de tourner en
     autonome en arrière-plan sur toutes les offres (voir /score et
     run_autonomous_scoring_cycle)."""
-    resume_ids = fetch_wp_resume_ids_by_title(payload.job.title)
+    job = fetch_wp_job(payload.job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offre introuvable")
+
+    resume_ids = fetch_wp_resume_ids_by_title(job.title)
     if not resume_ids:
-        return ScoreResponse(job_id=payload.job.id, count=0, duration_ms=0, results=[])
+        return ScoreResponse(job_id=job.id, count=0, duration_ms=0, results=[])
 
     resumes = fetch_wp_resumes_by_ids(resume_ids)
     cvs = [resume_to_cv_payload(resume) for resume in resumes]
 
-    return _run_score(ScoreRequest(job=payload.job, cvs=cvs), use_cross_encoder=False)
+    return _run_score(ScoreRequest(job=job, cvs=cvs), use_cross_encoder=False)
