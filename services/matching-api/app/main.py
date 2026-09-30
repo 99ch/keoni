@@ -171,6 +171,16 @@ class Settings:
     autonomous_scoring_min_rescore_interval_seconds: int = int(
         os.getenv("MATCHING_AUTONOMOUS_SCORING_MIN_RESCORE_INTERVAL_SECONDS", "3600")
     )
+    # Passage de réindexation CV incrémental, à chaque cycle -- indépendant
+    # de autonomous_scoring_workers (tourne sur le thread du cycle, pas
+    # dans le pool de workers de scoring), donc reste une source de charge
+    # concurrente même à 1 seul worker. Coupure temporaire utile le temps
+    # de rattraper un gros retard de scoring sans que le vivier de CV (qui
+    # avance en continu en prod) n'ajoute encore de la contention mémoire
+    # par-dessus (observé en prod, 2026-09-30).
+    autonomous_scoring_incremental_reindex_enabled: bool = (
+        os.getenv("MATCHING_AUTONOMOUS_SCORING_INCREMENTAL_REINDEX_ENABLED", "1") == "1"
+    )
 
 
 settings = Settings()
@@ -1342,17 +1352,18 @@ def run_autonomous_scoring_cycle() -> None:
     _autonomous_status["last_cycle_started_at"] = time.time()
 
     try:
-        overlap = timedelta(seconds=settings.autonomous_scoring_cv_watermark_overlap_seconds)
-        watermark = get_cv_pool_version()
-        modified_since = None
-        if watermark is not None:
-            modified_since = (watermark - overlap).strftime("%Y-%m-%d %H:%M:%S")
+        if settings.autonomous_scoring_incremental_reindex_enabled:
+            overlap = timedelta(seconds=settings.autonomous_scoring_cv_watermark_overlap_seconds)
+            watermark = get_cv_pool_version()
+            modified_since = None
+            if watermark is not None:
+                modified_since = (watermark - overlap).strftime("%Y-%m-%d %H:%M:%S")
 
-        run_full_reindex(
-            modified_since=modified_since,
-            lock=_incremental_reindex_lock,
-            status=_incremental_reindex_status,
-        )
+            run_full_reindex(
+                modified_since=modified_since,
+                lock=_incremental_reindex_lock,
+                status=_incremental_reindex_status,
+            )
 
         pool_version = get_cv_pool_version()
 
