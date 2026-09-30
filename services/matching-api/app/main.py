@@ -361,6 +361,16 @@ class ScoreRequest(BaseModel):
     cvs: List[CvPayload]
 
 
+class ScoreFastRequest(BaseModel):
+    """Branche rapide ('Lancer IA') : seule l'offre est fournie, les
+    candidats sont retrouvés côté serveur par correspondance de titre
+    (voir fetch_wp_resume_ids_by_title) -- même canal que l'ancien noeud
+    n8n 'Fetch CV L1 Strict Title'. L'appelant n'a donc pas à récupérer et
+    envoyer lui-même la liste des CV, contrairement à /score."""
+
+    job: JobPayload
+
+
 class ScoreItem(BaseModel):
     cv_id: int
     score: float
@@ -2373,8 +2383,12 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     }
 
 
-@app.post("/score", response_model=ScoreResponse)
-def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
+def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> ScoreResponse:
+    """Coeur commun de /score et /score-fast. `use_cross_encoder=False` saute
+    l'appel modèle en temps réel (rerank_with_cross_encoder) -- build_score()
+    retombe alors sur la similarité cosinus déjà calculée/indexée, sans
+    aucune inférence neuronale synchrone. C'est le seul écart entre les deux
+    chemins : même préparation, mêmes filtres, même formule de score."""
     if not payload.cvs:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Aucun CV fourni")
 
@@ -2401,7 +2415,7 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
 
     # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
     # ranked reste trié par similarité d'embedding, pas par ce score.
-    rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k)
+    rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
 
     scored_items: List[ScoreItem] = []
     for rank, (cv, sim) in enumerate(ranked):
@@ -2429,3 +2443,26 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
     duration_ms = int((time.perf_counter() - started) * 1000)
 
     return ScoreResponse(job_id=payload.job.id, count=len(scored_items), duration_ms=duration_ms, results=scored_items)
+
+
+@app.post("/score", response_model=ScoreResponse)
+def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
+    return _run_score(payload, use_cross_encoder=True)
+
+
+@app.post("/score-fast", response_model=ScoreResponse)
+def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
+    """Branche rapide : récupération des candidats par correspondance de
+    titre uniquement (pas de canal sémantique/taxonomie, pas de cross-
+    encoder) -- pensée pour un retour synchrone quasi instantané au clic
+    sur 'Lancer IA', pendant que le scoring complet continue de tourner en
+    autonome en arrière-plan sur toutes les offres (voir /score et
+    run_autonomous_scoring_cycle)."""
+    resume_ids = fetch_wp_resume_ids_by_title(payload.job.title)
+    if not resume_ids:
+        return ScoreResponse(job_id=payload.job.id, count=0, duration_ms=0, results=[])
+
+    resumes = fetch_wp_resumes_by_ids(resume_ids)
+    cvs = [resume_to_cv_payload(resume) for resume in resumes]
+
+    return _run_score(ScoreRequest(job=payload.job, cvs=cvs), use_cross_encoder=False)
