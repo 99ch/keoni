@@ -272,9 +272,6 @@ def warmup_cross_encoder_model() -> None:
             logging.warning("Cross-encoder warmup predict failed: %s", exc)
 
 
-_startup_reindex_thread: Optional[Thread] = None
-
-
 @app.on_event("startup")
 def resume_reindex_on_startup() -> None:
     """Relance le backfill CV à chaque démarrage du conteneur (voir
@@ -285,23 +282,16 @@ def resume_reindex_on_startup() -> None:
 
     Thread daemon nu (pas BackgroundTasks, qui dépend d'une requête HTTP
     en cours) : doit démarrer en tâche de fond sans bloquer le reste du
-    startup pendant potentiellement des heures.
-
-    La référence au thread est gardée (_startup_reindex_thread) pour que
-    la boucle de scoring autonome (start_autonomous_scoring_loop) puisse
-    attendre sa fin avant de commencer à traiter les offres -- les deux
-    tournant sur le même conteneur à mémoire limitée, les faire se
-    succéder plutôt que se chevaucher évite un pic de consommation au
-    démarrage (observé en prod : 89% de la limite mémoire avec les deux
-    en parallèle, 2026-09-29).
-    """
-    global _startup_reindex_thread
+    startup pendant potentiellement des heures. Tourne en parallèle de la
+    boucle de scoring autonome (pas de séquentialisation -- voir PR #19,
+    retirée depuis : un redéploiement relance ce reindex à chaque
+    démarrage, donc attendre sa fin retardait le scoring à chaque
+    déploiement, pas seulement au tout premier démarrage)."""
     if not settings.reindex_resume_on_startup:
         return
     if not _pgvector_ready:
         return
-    _startup_reindex_thread = Thread(target=run_full_reindex, daemon=True)
-    _startup_reindex_thread.start()
+    Thread(target=run_full_reindex, daemon=True).start()
     logging.info("Reprise automatique du reindex CV déclenchée au démarrage")
 
 
@@ -1412,18 +1402,13 @@ def run_autonomous_scoring_cycle() -> None:
 
 
 def autonomous_scoring_loop() -> None:
-    # Attendre la fin du rattrapage CV de démarrage avant de commencer à
-    # traiter les offres -- les deux tournant sinon en parallèle sur un
-    # conteneur à mémoire limitée (voir le commentaire sur
-    # _startup_reindex_thread dans resume_reindex_on_startup()). N'attend
-    # qu'une fois, au tout premier démarrage de cette boucle ; les passages
-    # incrémentaux suivants (dans run_autonomous_scoring_cycle) restent
-    # légers et n'ont pas besoin de cette séquentialisation.
-    if _startup_reindex_thread is not None:
-        logging.info("Scoring autonome: attente de la fin du reindex CV de démarrage")
-        _startup_reindex_thread.join()
-        logging.info("Scoring autonome: reindex CV de démarrage terminé, début du traitement des offres")
-
+    # Ne bloque plus sur la fin du reindex CV de démarrage (retiré -- voir
+    # PR #19 pour le comportement précédent) : un redéploiement relance ce
+    # reindex à chaque démarrage (voir resume_reindex_on_startup), donc
+    # attendre sa fin retardait le scoring à chaque déploiement, pas
+    # seulement au tout premier démarrage. Risque de contention mémoire
+    # avec un reindex qui retraite vraiment tout (ex. après un TRUNCATE
+    # manuel) : garder MATCHING_AUTONOMOUS_SCORING_WORKERS bas dans ce cas.
     while True:
         try:
             run_autonomous_scoring_cycle()
