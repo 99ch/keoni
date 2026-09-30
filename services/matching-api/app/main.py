@@ -162,6 +162,15 @@ class Settings:
     autonomous_scoring_cv_watermark_overlap_seconds: int = int(
         os.getenv("MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS", "600")
     )
+    # Délai minimum avant qu'une offre déjà scorée puisse être re-scorée
+    # uniquement parce que le vivier de CV a avancé (pas si son propre
+    # contenu a changé, ça reste immédiat) -- le vivier avance en continu
+    # en prod (nouveaux CV), donc sans ce délai les 67 offres ne se
+    # stabilisaient jamais, chaque cycle re-marquant tout le monde "à
+    # refaire". 1h par défaut : fraîcheur raisonnable sans re-churn constant.
+    autonomous_scoring_min_rescore_interval_seconds: int = int(
+        os.getenv("MATCHING_AUTONOMOUS_SCORING_MIN_RESCORE_INTERVAL_SECONDS", "3600")
+    )
 
 
 settings = Settings()
@@ -1226,10 +1235,23 @@ def _as_aware_utc(value: Optional[datetime]) -> Optional[datetime]:
 
 
 def job_needs_rescore(conn, job_id: int, wp_updated_at: str, pool_version: Optional[datetime]) -> bool:
+    """Une offre a besoin d'être rescorée si : jamais scorée, son propre
+    contenu a changé (toujours immédiat, pas de délai), ou le vivier de CV
+    a avancé depuis son dernier passage ET que ce dernier passage date
+    d'assez longtemps (autonomous_scoring_min_rescore_interval_seconds).
+
+    Cette dernière condition est nécessaire : en prod, le vivier avance en
+    continu (nouveaux CV uploadés en permanence) -- sans délai minimum,
+    une offre tout juste rescorée était immédiatement re-marquée "à
+    refaire" dès que le cycle suivant voyait le vivier avoir ne serait-ce
+    qu'un peu bougé, empêchant les 67 offres de jamais se stabiliser
+    (observé en prod : jobs_in_flight oscillant sans jamais descendre,
+    2026-09-30)."""
     row = conn.execute(
         select(
             JobScoringState.last_scored_job_modified,
             JobScoringState.last_scored_cv_pool_version,
+            JobScoringState.last_scored_at,
         ).where(JobScoringState.job_id == job_id)
     ).first()
 
@@ -1237,6 +1259,12 @@ def job_needs_rescore(conn, job_id: int, wp_updated_at: str, pool_version: Optio
         return True
     if (wp_updated_at or "") != (row.last_scored_job_modified or ""):
         return True
+
+    last_scored_at = _as_aware_utc(row.last_scored_at)
+    if last_scored_at is not None:
+        cooldown = timedelta(seconds=settings.autonomous_scoring_min_rescore_interval_seconds)
+        if datetime.now(timezone.utc) - last_scored_at < cooldown:
+            return False
 
     last_pool = _as_aware_utc(row.last_scored_cv_pool_version)
     pool_version = _as_aware_utc(pool_version)
