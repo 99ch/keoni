@@ -50,7 +50,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, List, Optional, Sequence, Tuple, Union
 
-from app.taxonomy import normalize_skill
+from app.taxonomy import find_skills, normalize_skill
 
 WORD_PATTERN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+")
 DEFAULT_STOPWORDS = {
@@ -384,7 +384,14 @@ def infer_seniority_years(job: PreparedJob) -> int:
 # chaque moitié -- le découper ici en amont la rendrait inutile.
 
 _BULLET_PREFIX_RE = re.compile(r"^(?:[•◦‣▪·\-\*]|\(?\d+[.)])\s+")
-_KEYWORDS_HEADER_MARKERS = ("mots cle", "mot cle", "keyword")
+# "competences recherchees"/"obligatoire"/"optionnel" : titres de section
+# observés en prod sur une offre réelle ("Compétences recherchées :\n-
+# Obligatoires :\n...\n  - Optionnelles :\n...") -- sans ce filtre, ces
+# lignes passent comme autant de "mots-clés" jamais matchables (ni
+# expand_priority_keyword_term ni aucun CV ne les reconnaîtra jamais comme
+# compétence), gonflant inutilement le dénominateur et polluant l'affichage
+# "mots-clés manquants" côté recruteur.
+_KEYWORDS_HEADER_MARKERS = ("mots cle", "mot cle", "keyword", "competences recherchees", "obligatoire", "optionnel")
 # Champ WYSIWYG WordPress saisi en liste (<ul><li>...</li></ul>) : les
 # limites de <li>/<br>/<p> doivent devenir des retours à la ligne AVANT le
 # retrait des balises (strip_html les remplace par un simple espace), sinon
@@ -446,6 +453,43 @@ def normalize_priority_keyword(raw_term: str) -> Optional[str]:
     return None
 
 
+def expand_priority_keyword_term(raw_term: str) -> List[str]:
+    """Résout un terme brut de mots-clés prioritaires en zéro, une ou
+    plusieurs compétences canoniques -- même détecteur (find_skills) que
+    celui utilisé sur le texte complet du CV/de l'offre pour
+    skills_canonical, pour que "mots-clés prioritaires" et "compétences"
+    parlent le même langage plutôt que deux mécanismes distincts (demandé
+    explicitement : réutiliser la même méthode d'extraction/identification
+    pour les offres que pour les CV).
+
+    normalize_priority_keyword() suppose un terme COURT, déjà une
+    compétence isolée ("Python", "MOA / AMOA") -- ce qui est le cas quand
+    le champ WP est réellement une liste de mots-clés. Mais certains
+    recruteurs saisissent ce même champ comme un paragraphe rédigé en
+    phrases ("Connaissance des langages de programmation (Python, Java,
+    SQL)", "Processus de développement : bonne compréhension des
+    méthodologies Agile et des cycles de développement") -- observé en
+    prod sur une offre DevSecOps réelle, où 14 "mots-clés" sur 16
+    n'étaient jamais matchables (des fragments de phrase coupés par la
+    virgule interne aux parenthèses, ou des phrases entières), plafonnant
+    le score à ~43% pour un candidat qui couvrait pourtant l'essentiel du
+    stack demandé. find_skills() scanne le terme entier (quelle que soit
+    sa longueur, ponctuation incluse -- le tokenizer ignore déjà
+    parenthèses/deux-points) et en extrait TOUTES les compétences
+    reconnues, au lieu d'exiger que le terme entier soit lui-même une
+    compétence.
+
+    Repli sur le terme brut lui-même (comme avant) si ni normalize_skill()
+    ni find_skills() n'y reconnaissent rien -- laisse enrich_cv_skills()
+    la chance de le retrouver littéralement dans le CV (sigle métier hors
+    référentiel, ex. "LOD2", "TRM")."""
+    direct = normalize_priority_keyword(raw_term)
+    found = find_skills(raw_term)
+    if direct and direct not in found:
+        found = [direct] + found
+    return found or [raw_term]
+
+
 def enrich_cv_skills(job: PreparedJob, cv: PreparedCv) -> FrozenSet[str]:
     """Complète cv.skills_canonical avec les mots-clés prioritaires bruts
     trouvés littéralement dans le texte du CV mais sans entrée taxonomie
@@ -459,9 +503,10 @@ def enrich_cv_skills(job: PreparedJob, cv: PreparedCv) -> FrozenSet[str]:
     extra: set[str] = set()
     cv_text_folded = fold_text(cv.text)
     for raw_term in job.keyword_terms_raw:
-        canonical = normalize_priority_keyword(raw_term)
-        if canonical or raw_term in cv.skills_canonical:
+        if expand_priority_keyword_term(raw_term) != [raw_term]:
             continue  # déjà détectable via skills_canonical comme n'importe quelle autre compétence
+        if raw_term in cv.skills_canonical:
+            continue
         if re.search(rf"\b{re.escape(fold_text(raw_term))}\b", cv_text_folded):
             extra.add(raw_term)
     return frozenset(cv.skills_canonical) | extra
@@ -471,15 +516,18 @@ def resolve_priority_keywords(
     job: PreparedJob, cv_skills: FrozenSet[str]
 ) -> Tuple[List[str], List[str]]:
     """(matched, all_terms) : mots-clés prioritaires de l'offre résolus à
-    leur canonique taxonomie (ou laissés en terme brut si inconnu),
-    DÉDUPLIQUÉS par canonique. Portage de _resolve_priority_keywords."""
+    leur(s) canonique(s) taxonomie -- un terme brut peut désormais résoudre
+    en plusieurs compétences (voir expand_priority_keyword_term), ou rester
+    tel quel si inconnu -- DÉDUPLIQUÉS par canonique. Portage de
+    _resolve_priority_keywords, étendu pour la résolution multi-compétences
+    par terme."""
     seen: dict[str, None] = {}
     matched_seen: dict[str, None] = {}
     for raw_term in job.keyword_terms_raw:
-        canonical = normalize_priority_keyword(raw_term) or raw_term
-        seen.setdefault(canonical, None)
-        if canonical in cv_skills:
-            matched_seen.setdefault(canonical, None)
+        for canonical in expand_priority_keyword_term(raw_term):
+            seen.setdefault(canonical, None)
+            if canonical in cv_skills:
+                matched_seen.setdefault(canonical, None)
     return list(matched_seen), list(seen)
 
 
@@ -495,28 +543,37 @@ _TITLE_ALTERNATION_RE = re.compile(r"/|\bou\b", re.IGNORECASE)
 def core_keyword_coverage(job: PreparedJob, cv_skills: FrozenSet[str]) -> float:
     """Couverture (0.0-1.0) des mots-clés "appuyés" de l'offre. Portage à
     l'identique de _core_keyword_coverage : 1.0 (aucune pénalité) quand
-    aucun mot-clé n'est appuyé."""
+    aucun mot-clé n'est appuyé. Compte les répétitions sur les compétences
+    RÉSOLUES (voir expand_priority_keyword_term), pas sur les lignes
+    brutes : une même compétence citée dans plusieurs lignes distinctes du
+    champ recruteur doit compter comme répétée, même si aucune des lignes
+    n'est identique mot pour mot."""
     if not job.keyword_terms_raw:
         return 1.0
-    counts = Counter(normalize_priority_keyword(t) or t for t in job.keyword_terms_raw)
+
+    # Liste (pas dict) : job.keyword_terms_raw peut légitimement contenir le
+    # même terme brut plusieurs fois ("SAS", "SAS", "SAS") -- une clé de
+    # dict sur raw_term écraserait les répétitions avant même le comptage.
+    term_canonicals = [expand_priority_keyword_term(raw_term) for raw_term in job.keyword_terms_raw]
+    counts: Counter[str] = Counter()
+    for canonicals in term_canonicals:
+        counts.update(canonicals)
     core = {canonical for canonical, n in counts.items() if n >= _CORE_KEYWORD_MIN_REPEATS}
 
     title_folded = "" if _TITLE_ALTERNATION_RE.search(job.title) else fold_text(job.title)
-    matched = {c for c in core if c in cv_skills}
     if title_folded:
-        for raw_term in job.keyword_terms_raw:
-            canonical = normalize_priority_keyword(raw_term) or raw_term
-            if canonical in core:
-                continue
-            term_folded = fold_text(raw_term)
-            if not term_folded or not re.search(rf"\b{re.escape(term_folded)}\b", title_folded):
-                continue
-            core.add(canonical)
-            if canonical in cv_skills or raw_term in cv_skills:
-                matched.add(canonical)
+        for canonicals in term_canonicals:
+            for canonical in canonicals:
+                if canonical in core:
+                    continue
+                canonical_folded = fold_text(canonical)
+                if not canonical_folded or not re.search(rf"\b{re.escape(canonical_folded)}\b", title_folded):
+                    continue
+                core.add(canonical)
 
     if not core:
         return 1.0
+    matched = {c for c in core if c in cv_skills}
     return len(matched) / len(core)
 
 
