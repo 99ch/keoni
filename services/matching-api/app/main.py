@@ -360,6 +360,11 @@ class CvPayload(BaseModel):
     # /score-fast pour éviter de re-télécharger/re-extraire (OCR/Tika) le
     # fichier à chaque appel. Jamais rempli depuis le payload WordPress brut.
     cached_extracted_text: Optional[str] = None
+    # "title" (correspondance stricte de titre, ex-L1 n8n) ou "similar"
+    # (retenu par le canal sémantique/taxonomie uniquement) -- injecté par
+    # retrieve() (voir son commentaire), jamais fourni par un appelant.
+    # None pour un CV passé directement à /score sans passer par retrieve().
+    retrieval_channel: Optional[str] = None
     keywords: Optional[Union[str, List[str]]] = None
     metadata: Optional[dict] = None
     file_path: Optional[str] = None
@@ -1003,6 +1008,7 @@ def resume_to_cv_payload(resume: dict) -> "CvPayload":
         candidate_email=resume.get("email") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
         cached_extracted_text=resume.get("cached_extracted_text") or None,
+        retrieval_channel=resume.get("retrieval_channel") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
         file_path=resume.get("file_path") or None,
@@ -2075,6 +2081,10 @@ def build_score(
         "weights": result.weights,
         "score_breakdown": result.breakdown,
         "low_confidence_components": result.low_confidence_components,
+        # "title" / "similar" / None -- voir CvPayload.retrieval_channel.
+        # Consommé côté keoni-bridge pour séparer visuellement les deux
+        # groupes (correspondance de titre stricte vs similarité).
+        "retrieval_channel": cv.payload.retrieval_channel,
     }
 
     return ScoreItem(
@@ -2391,11 +2401,20 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
         # réindexé retombe simplement sur l'extraction à la volée.
         cached_text_by_id = fetch_cached_cv_text(conn, combined_ids)
 
+    # "title" prioritaire sur "similar" quand un CV est retenu par les deux
+    # canaux -- correspondance de titre strict (ex-L1 n8n) est le signal le
+    # plus explicite, affiché comme tel côté keoni-bridge (deux sections
+    # séparées : "titre strict" vs "candidats similaires").
+    channel_by_id: Dict[int, str] = {cv_id: "similar" for cv_id in semantic_ids + taxonomy_ids}
+    channel_by_id.update({cv_id: "title" for cv_id in title_ids})
+
     cvs = fetch_wp_resumes_by_ids(combined_ids)
     for cv in cvs:
-        cached_text = cached_text_by_id.get(cv.get("id"))
+        cv_id = cv.get("id")
+        cached_text = cached_text_by_id.get(cv_id)
         if cached_text:
             cv["cached_extracted_text"] = cached_text
+        cv["retrieval_channel"] = channel_by_id.get(cv_id, "similar")
 
     return {
         "job_id": job.id,
