@@ -994,14 +994,15 @@ def fetch_wp_resume_ids_by_title(title: str) -> List[int]:
 def resume_to_cv_payload(resume: dict) -> "CvPayload":
     # resume/text_content/skills volontairement absents : résumé superficiel
     # côté keoni-bridge (build_resume_text_content()), jamais utilisé pour
-    # le scoring -- voir assemble_cv_text(). cached_extracted_text (texte du
-    # vrai fichier, depuis le cache de réindex) est rempli séparément par
-    # l'appelant (score_fast()) quand disponible.
+    # le scoring -- voir assemble_cv_text(). cached_extracted_text est lu
+    # directement depuis `resume` quand déjà injecté en amont (retrieve()) ;
+    # sinon un appelant peut encore le renseigner séparément après coup.
     metadata = resume.get("metadata")
     return CvPayload(
         id=int(resume.get("id") or 0),
         candidate_email=resume.get("email") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
+        cached_extracted_text=resume.get("cached_extracted_text") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
         file_path=resume.get("file_path") or None,
@@ -2476,37 +2477,24 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
 
 @app.post("/score-fast", response_model=ScoreResponse)
 def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
-    """Branche rapide : offre récupérée par id, candidats par correspondance
-    de titre uniquement (pas de canal sémantique/taxonomie, pas de cross-
-    encoder) -- pensée pour un retour synchrone quasi instantané au clic
-    sur 'Lancer IA', pendant que le scoring complet continue de tourner en
-    autonome en arrière-plan sur toutes les offres (voir /score et
-    run_autonomous_scoring_cycle)."""
+    """Branche rapide : offre récupérée par id, candidats via le même
+    moteur de récupération hybride que la branche autonome (retrieve() --
+    sémantique pgvector + taxonomie + titre, voir son commentaire), pas
+    seulement la correspondance de titre d'origine (L1/L2/L3 remplacés en
+    une seule passe, voir retrieve()) -- pensée pour un retour synchrone
+    quasi instantané au clic sur 'Lancer IA'. Le seul écart restant avec
+    /score est l'absence de cross-encoder (use_cross_encoder=False) : la
+    recherche pgvector elle-même reste indexée, sans inférence neuronale
+    synchrone, donc ne casse pas l'objectif 'instantané'."""
     job = fetch_wp_job(payload.job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Offre introuvable")
 
-    resume_ids = fetch_wp_resume_ids_by_title(job.title)
-    if not resume_ids:
+    retrieved = retrieve(RetrieveRequest(job=job), None)
+    resumes = retrieved.get("cvs") or []
+    if not resumes:
         return ScoreResponse(job_id=job.id, count=0, duration_ms=0, results=[])
 
-    resumes = fetch_wp_resumes_by_ids(resume_ids)
     cvs = [resume_to_cv_payload(resume) for resume in resumes]
-
-    # Même réutilisation du texte déjà extrait lors d'un réindex précédent
-    # que /retrieve (voir fetch_cached_cv_text) -- sans ça, assemble_cv_text()
-    # devrait télécharger et OCR/parser le fichier de chaque candidat en
-    # direct à chaque clic sur "Lancer IA", au lieu de réutiliser ce qui a
-    # déjà été extrait par le réindex. Un moteur indisponible ne bloque pas
-    # la branche rapide : chaque CV retombe simplement sur l'extraction à
-    # la volée dans assemble_cv_text().
-    engine = get_engine()
-    if engine is not None:
-        with engine.begin() as conn:
-            cached_text_by_id = fetch_cached_cv_text(conn, resume_ids)
-        for cv in cvs:
-            cached_text = cached_text_by_id.get(cv.id)
-            if cached_text:
-                cv.cached_extracted_text = cached_text
 
     return _run_score(ScoreRequest(job=job, cvs=cvs), use_cross_encoder=False)
