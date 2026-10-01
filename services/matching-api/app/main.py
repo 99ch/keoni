@@ -695,14 +695,15 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     salary_min = parse_float(find_first(meta, ["salaryfrom", "salary_min", "salary_from"]))
     salary_max = parse_float(find_first(meta, ["salaryto", "salary_max", "salary_to", "tjm", "salary"]))
 
-    # job.keywords brut (avant dédup) alimente le mécanisme "mots-clés
-    # prioritaires" (couverture + pénalité core-keyword) — voir le
-    # commentaire en tête de section dans app/scoring.py. job.keywords vient
-    # du champ WP `tags`, qui n'a jamais de champ de saisie recruteur côté
-    # js-jobs (aucune offre observée ne l'a rempli) : on retombe sur
-    # meta.skills (champ WP `prefferdskills`, "Preferred Skills"), le seul
-    # champ effectivement et systématiquement rempli par les recruteurs.
-    keyword_terms_raw = split_priority_keyword_terms(job.keywords) or split_priority_keyword_terms(meta.get("skills"))
+    # job.keywords brut (avant dédup) alimente PUREMENT le mécanisme
+    # "mots-clés prioritaires" (couverture + pénalité core-keyword) -- voir
+    # le commentaire en tête de section dans app/scoring.py. job.keywords
+    # vient du champ WP `metakeywords` ("Méta Mots-clés", voir
+    # Keoni_Bridge_Rest::get_job()) -- décision explicite (2026-10-01) de ne
+    # plus retomber sur meta.skills (champ WP `prefferdskills`,
+    # "Compétences") : les deux champs ont des usages distincts côté
+    # recruteur, "Compétences" n'est plus utilisé par le scoring du tout.
+    keyword_terms_raw = split_priority_keyword_terms(job.keywords)
     scoring_profile = job.scoring_profile or normalized_text(find_first(meta, ["scoring_profile", "profil_scoring"])) or None
 
     return PreparedJob(
