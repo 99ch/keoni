@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import tempfile
 from urllib.parse import urlparse
@@ -347,9 +347,19 @@ class CvPayload(BaseModel):
     candidate_email: Optional[str] = None
     application_title: Optional[str] = None
     title: Optional[str] = None
+    # resume/text_content/skills : conservés uniquement pour compatibilité
+    # avec d'anciens appelants qui les enverraient encore -- plus jamais lus
+    # par assemble_cv_text() (voir son commentaire). Le texte de scoring
+    # vient exclusivement du vrai fichier CV, en direct ou via le cache
+    # cached_extracted_text ci-dessous.
     resume: Optional[str] = None
     text_content: Optional[str] = None
     skills: Optional[str] = None
+    # Texte déjà extrait du vrai fichier CV lors d'un réindex précédent
+    # (CvEmbedding.text_content côté Postgres) -- injecté par /retrieve et
+    # /score-fast pour éviter de re-télécharger/re-extraire (OCR/Tika) le
+    # fichier à chaque appel. Jamais rempli depuis le payload WordPress brut.
+    cached_extracted_text: Optional[str] = None
     keywords: Optional[Union[str, List[str]]] = None
     metadata: Optional[dict] = None
     file_path: Optional[str] = None
@@ -607,23 +617,24 @@ def text_from_file(path: Path) -> str:
 
 
 def assemble_cv_text(cv: CvPayload) -> str:
-    # text_content/resume peuvent venir d'un champ WYSIWYG WordPress et
-    # contenir du balisage HTML brut -- même nettoyage que côté offre.
-    parts: List[str] = []
-    for value in [cv.text_content, cv.resume, cv.skills]:
-        if value:
-            parts.append(strip_html(value))
+    """Texte du CV utilisé pour le scoring -- toujours issu du vrai fichier
+    (via le cache cached_extracted_text, déjà extrait lors d'un réindex
+    précédent, sinon en le téléchargeant/l'extrayant à la volée). Ne lit
+    plus jamais text_content/resume/skills ni metadata.summary/experience/
+    notes du payload WordPress : ces champs ne sont qu'un résumé superficiel
+    (titre + nom + mots-clés côté keoni-bridge, build_resume_text_content())
+    qui masquait silencieusement d'excellents CV derrière un score quasi nul
+    -- observé en prod sur /score-fast (score 13% pour un candidat 25 ans
+    d'expérience dont le vrai CV matchait largement l'offre), et par
+    construction sur /score direct aussi puisque cette fonction est
+    partagée. Un candidat sans fichier CV réel n'est désormais plus scoré
+    du tout (texte vide -> filtré par l'appelant) plutôt que scoré sur un
+    texte trompeur.
+    """
+    if cv.cached_extracted_text:
+        return cv.cached_extracted_text
 
     meta = cv.metadata or {}
-    for key in ("summary", "experience", "notes", "resume"):
-        value = meta.get(key)
-        if isinstance(value, str):
-            parts.append(strip_html(value))
-
-    combined = normalize_whitespace(" ".join(parts))
-    if combined:
-        return combined
-
     file_candidate = cv.file_path or meta.get("file_path")
     if file_candidate:
         is_remote = urlparse(file_candidate).scheme in ("http", "https")
@@ -639,6 +650,21 @@ def assemble_cv_text(cv: CvPayload) -> str:
                     resolved.unlink(missing_ok=True)
 
     return ""
+
+
+def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, str]:
+    """Texte déjà extrait du vrai fichier CV lors d'un réindex précédent
+    (CvEmbedding.text_content) -- à injecter dans CvPayload.cached_extracted_text
+    (jamais dans text_content/resume/skills, voir assemble_cv_text()) pour
+    que /retrieve et /score-fast évitent de re-télécharger/re-extraire le
+    fichier à chaque appel. Un cv_id absent du résultat (jamais réindexé)
+    retombe simplement sur l'extraction à la volée côté assemble_cv_text()."""
+    if not cv_ids:
+        return {}
+    rows = conn.execute(
+        select(CvEmbedding.cv_id, CvEmbedding.text_content).where(CvEmbedding.cv_id.in_(cv_ids))
+    ).all()
+    return {row.cv_id: row.text_content for row in rows if row.text_content}
 
 
 def prepare_job(job: JobPayload) -> PreparedJob:
@@ -704,7 +730,9 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
     text = assemble_cv_text(cv)
     text_tokens = tokenize(text) if text else set()
     title_tokens = tokenize(" ".join(filter(None, [cv.application_title, cv.title])))
-    keywords = parse_keywords(cv.keywords) + parse_keywords(meta.get("keywords")) + parse_keywords(cv.skills)
+    # cv.skills volontairement exclu : champ du payload WordPress, jamais
+    # utilisé pour le scoring (voir assemble_cv_text()).
+    keywords = parse_keywords(cv.keywords) + parse_keywords(meta.get("keywords"))
     keywords = list(dict.fromkeys(keywords))
     location = (cv.location or meta.get("location") or "").lower()
 
@@ -963,14 +991,16 @@ def fetch_wp_resume_ids_by_title(title: str) -> List[int]:
 
 
 def resume_to_cv_payload(resume: dict) -> "CvPayload":
+    # resume/text_content/skills volontairement absents : résumé superficiel
+    # côté keoni-bridge (build_resume_text_content()), jamais utilisé pour
+    # le scoring -- voir assemble_cv_text(). cached_extracted_text (texte du
+    # vrai fichier, depuis le cache de réindex) est rempli séparément par
+    # l'appelant (score_fast()) quand disponible.
     metadata = resume.get("metadata")
     return CvPayload(
         id=int(resume.get("id") or 0),
         candidate_email=resume.get("email") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
-        resume=resume.get("resume") or None,
-        text_content=resume.get("text_content") or None,
-        skills=resume.get("skills") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
         file_path=resume.get("file_path") or None,
@@ -2352,27 +2382,18 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
 
         combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids + title_ids))
 
-        # Texte déjà extrait au moment du réindex -- injecté dans les CV
-        # renvoyés pour que /score (via assemble_cv_text) le réutilise au
-        # lieu de re-télécharger et re-extraire (OCR/Tika) le fichier à
-        # chaque appel. Un CV pas encore réindexé (text_content vide)
-        # retombe simplement sur l'ancien chemin d'extraction à la volée.
-        cached_text_rows = (
-            conn.execute(
-                select(CvEmbedding.cv_id, CvEmbedding.text_content).where(
-                    CvEmbedding.cv_id.in_(combined_ids)
-                )
-            ).all()
-            if combined_ids
-            else []
-        )
-        cached_text_by_id = {row.cv_id: row.text_content for row in cached_text_rows if row.text_content}
+        # Texte déjà extrait au moment du réindex -- injecté dans
+        # cached_extracted_text (jamais text_content, voir assemble_cv_text)
+        # pour que /score le réutilise au lieu de re-télécharger et
+        # re-extraire (OCR/Tika) le fichier à chaque appel. Un CV pas encore
+        # réindexé retombe simplement sur l'extraction à la volée.
+        cached_text_by_id = fetch_cached_cv_text(conn, combined_ids)
 
     cvs = fetch_wp_resumes_by_ids(combined_ids)
     for cv in cvs:
         cached_text = cached_text_by_id.get(cv.get("id"))
         if cached_text:
-            cv["text_content"] = cached_text
+            cv["cached_extracted_text"] = cached_text
 
     return {
         "job_id": job.id,
@@ -2470,5 +2491,21 @@ def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) ->
 
     resumes = fetch_wp_resumes_by_ids(resume_ids)
     cvs = [resume_to_cv_payload(resume) for resume in resumes]
+
+    # Même réutilisation du texte déjà extrait lors d'un réindex précédent
+    # que /retrieve (voir fetch_cached_cv_text) -- sans ça, assemble_cv_text()
+    # devrait télécharger et OCR/parser le fichier de chaque candidat en
+    # direct à chaque clic sur "Lancer IA", au lieu de réutiliser ce qui a
+    # déjà été extrait par le réindex. Un moteur indisponible ne bloque pas
+    # la branche rapide : chaque CV retombe simplement sur l'extraction à
+    # la volée dans assemble_cv_text().
+    engine = get_engine()
+    if engine is not None:
+        with engine.begin() as conn:
+            cached_text_by_id = fetch_cached_cv_text(conn, resume_ids)
+        for cv in cvs:
+            cached_text = cached_text_by_id.get(cv.id)
+            if cached_text:
+                cv.cached_extracted_text = cached_text
 
     return _run_score(ScoreRequest(job=job, cvs=cvs), use_cross_encoder=False)
