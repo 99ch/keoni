@@ -975,9 +975,25 @@ def fetch_wp_resume_ids_by_title(title: str) -> List[int]:
     offset = 0
     ids: List[int] = []
     while True:
+        # "_" : paramètre jetable, jamais lu côté keoni-bridge -- un même
+        # titre produit sinon une URL identique à chaque appel, repérée en
+        # prod comme mise en cache côté hébergeur WP (hors de notre
+        # contrôle) et resservie périmée aux appels authentifiés par clé API
+        # (contournée pour une session admin connectée, qui bypass ce cache
+        # -- diagnostiqué 2026-10-01 : 20 CV réels introuvables via l'API
+        # pour "DevSecOps", alors que présents et trouvés via une requête
+        # identique authentifiée par cookie admin). Les autres appels
+        # (fetch_wp_resumes_by_ids, etc.) varient déjà naturellement d'un
+        # run à l'autre (liste d'ids différente), donc jamais touchés par
+        # ce même risque de cache -- pas de raison de les modifier aussi.
         response = requests.get(
             url,
-            params={"application_title": title, "offset": offset, "limit": page_size},
+            params={
+                "application_title": title,
+                "offset": offset,
+                "limit": page_size,
+                "_": str(int(time.time() * 1000)),
+            },
             headers=headers,
             timeout=30,
         )
