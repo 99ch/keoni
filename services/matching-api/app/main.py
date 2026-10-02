@@ -2469,9 +2469,27 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
 
     candidates = filtered_usable if filtered_usable else usable
 
-    ranked = rank_with_pgvector(job, payload.job.id, candidates, settings.top_k) if _pgvector_ready else None
+    # Les candidats du canal "titre" (retrieve(), voir CvPayload.retrieval_
+    # channel) ne doivent jamais se faire évincer par la coupe top_k sur la
+    # seule similarité d'embedding brute -- une correspondance de titre
+    # stricte reste pertinente même si le texte du CV est peu proche
+    # sémantiquement de l'offre. Bug réel constaté en production (offre
+    # "DevSecOps", 2026-10-01) : /retrieve renvoyait bien les CV
+    # correspondant par titre, mais rank_with_pgvector()/rank_with_faiss()
+    # les éliminait silencieusement avant même build_score() dès que le
+    # reste du vivier (sémantique/taxonomie) remplissait à lui seul les
+    # top_k places. On élargit la limite exactement du nombre de candidats
+    # "titre" présents, pour leur garantir une vraie place dans le
+    # classement (ils restent ensuite soumis au même tri par score final
+    # que tout le monde -- aucun passe-droit sur le score lui-même).
+    title_count = sum(
+        1 for cv in candidates if getattr(cv.payload, "retrieval_channel", None) == "title"
+    )
+    effective_top_k = settings.top_k + title_count
+
+    ranked = rank_with_pgvector(job, payload.job.id, candidates, effective_top_k) if _pgvector_ready else None
     if ranked is None:
-        ranked = rank_with_faiss(job, candidates, settings.top_k)
+        ranked = rank_with_faiss(job, candidates, effective_top_k)
 
     # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
     # ranked reste trié par similarité d'embedding, pas par ce score.
