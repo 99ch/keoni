@@ -2505,6 +2505,23 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
         cv, sim = ranked[0]
         scored_items.append(build_score(job, cv, sim, 0, rerank_scores.get(cv.payload.id)))
 
+    # Une même personne peut avoir plusieurs fiches de candidature distinctes
+    # (même email, intitulés différents à chaque candidature) -- constaté en
+    # prod : jusqu'à 16 candidatures pour une seule personne, dont 9 dans un
+    # même top-20. On ne garde que la fiche la mieux notée par email, pour
+    # ne jamais montrer deux fois le même candidat dans le classement final
+    # -- décision explicite 2026-10-02. Email absent/vide : pas de
+    # regroupement possible, chaque fiche reste indépendante (clé par
+    # cv_id) plutôt que risquer de fusionner des candidats différents.
+    email_by_cv_id = {cv.payload.id: (cv.payload.candidate_email or "").strip().lower() for cv, _ in ranked}
+    best_by_candidate: dict[str, ScoreItem] = {}
+    for item in scored_items:
+        key = email_by_cv_id.get(item.cv_id) or f"cv:{item.cv_id}"
+        current = best_by_candidate.get(key)
+        if current is None or item.score > current.score:
+            best_by_candidate[key] = item
+    scored_items = list(best_by_candidate.values())
+
     # Final deterministic ranking must follow final score, not raw embedding rank.
     scored_items.sort(
         key=lambda item: (
