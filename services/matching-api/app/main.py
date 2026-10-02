@@ -2495,6 +2495,11 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # ranked reste trié par similarité d'embedding, pas par ce score.
     rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
 
+    # TEMPORAIRE -- diagnostic uniquement (2026-10-02), a retirer.
+    _debug_ranked_title_count = sum(
+        1 for cv, _ in ranked if getattr(cv.payload, "retrieval_channel", None) == "title"
+    )
+
     scored_items: List[ScoreItem] = []
     for rank, (cv, sim) in enumerate(ranked):
         if sim < settings.min_similarity:
@@ -2504,6 +2509,11 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     if not scored_items and ranked:
         cv, sim = ranked[0]
         scored_items.append(build_score(job, cv, sim, 0, rerank_scores.get(cv.payload.id)))
+
+    # TEMPORAIRE -- diagnostic uniquement (2026-10-02), a retirer.
+    for _dbg_item in scored_items:
+        _dbg_item.extra["_debug_title_count"] = title_count
+        _dbg_item.extra["_debug_ranked_title_count"] = _debug_ranked_title_count
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en
