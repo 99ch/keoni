@@ -2513,13 +2513,30 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # -- décision explicite 2026-10-02. Email absent/vide : pas de
     # regroupement possible, chaque fiche reste indépendante (clé par
     # cv_id) plutôt que risquer de fusionner des candidats différents.
+    # Garder la fiche la mieux notée peut faire perdre l'étiquette "titre"
+    # sans ce correctif : si la fiche qui a matché par titre strict n'est
+    # pas celle qui score le mieux pour cette personne, le dédoublonnage
+    # ci-dessus gardait silencieusement une autre fiche "similar" à sa
+    # place, et plus aucun résultat final n'était marqué "titre" pour
+    # cette offre (constaté en prod : 0/104 -- les 20 fiches "titre"
+    # existaient bien en amont, mais aucune n'était la mieux notée de sa
+    # personne). On retient toujours la fiche la mieux notée par email,
+    # mais si CETTE personne a ne serait-ce qu'une fiche "titre" ailleurs
+    # dans le lot, l'étiquette est reportée sur la fiche conservée.
     email_by_cv_id = {cv.payload.id: (cv.payload.candidate_email or "").strip().lower() for cv, _ in ranked}
     best_by_candidate: dict[str, ScoreItem] = {}
+    title_seen: set[str] = set()
     for item in scored_items:
         key = email_by_cv_id.get(item.cv_id) or f"cv:{item.cv_id}"
+        if item.extra.get("retrieval_channel") == "title":
+            title_seen.add(key)
         current = best_by_candidate.get(key)
         if current is None or item.score > current.score:
             best_by_candidate[key] = item
+    for key in title_seen:
+        kept = best_by_candidate.get(key)
+        if kept is not None:
+            kept.extra["retrieval_channel"] = "title"
     scored_items = list(best_by_candidate.values())
 
     # Final deterministic ranking must follow final score, not raw embedding rank.
