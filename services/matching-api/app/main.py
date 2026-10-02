@@ -2478,27 +2478,43 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # correspondant par titre, mais rank_with_pgvector()/rank_with_faiss()
     # les éliminait silencieusement avant même build_score() dès que le
     # reste du vivier (sémantique/taxonomie) remplissait à lui seul les
-    # top_k places. On élargit la limite exactement du nombre de candidats
-    # "titre" présents, pour leur garantir une vraie place dans le
-    # classement (ils restent ensuite soumis au même tri par score final
-    # que tout le monde -- aucun passe-droit sur le score lui-même).
-    title_count = sum(
-        1 for cv in candidates if getattr(cv.payload, "retrieval_channel", None) == "title"
-    )
-    effective_top_k = settings.top_k + title_count
+    # top_k places.
+    #
+    # Un premier correctif élargissait juste la limite de top_k à
+    # top_k + title_count, en supposant que le reste du vivier tenait déjà
+    # dans top_k -- hypothèse fausse en pratique (retrieve() peut fournir
+    # bien plus de candidats "similar" que top_k à lui seul, constaté en
+    # prod : les 20 candidats "titre" avaient beau exister dans `candidates`
+    # en entrée, aucun ne survivait au classement). Les deux canaux sont
+    # donc classés séparément puis fusionnés : le canal "titre" sans aucune
+    # coupe (nativement étroit), le canal "similar" avec la coupe top_k
+    # habituelle -- toujours triés par la même similarité, aucun passe-droit
+    # sur le score lui-même, juste la garantie que "titre" ne rentre jamais
+    # en concurrence avec "similar" pour une place dans le classement brut.
+    title_candidates = [
+        cv for cv in candidates if getattr(cv.payload, "retrieval_channel", None) == "title"
+    ]
+    other_candidates = [
+        cv for cv in candidates if getattr(cv.payload, "retrieval_channel", None) != "title"
+    ]
 
-    ranked = rank_with_pgvector(job, payload.job.id, candidates, effective_top_k) if _pgvector_ready else None
-    if ranked is None:
-        ranked = rank_with_faiss(job, candidates, effective_top_k)
+    ranked_title: List[Tuple[PreparedCv, float]] = []
+    if title_candidates:
+        ranked_title = rank_with_pgvector(
+            job, payload.job.id, title_candidates, len(title_candidates)
+        ) if _pgvector_ready else None
+        if ranked_title is None:
+            ranked_title = rank_with_faiss(job, title_candidates, len(title_candidates))
+
+    ranked_other = rank_with_pgvector(job, payload.job.id, other_candidates, settings.top_k) if _pgvector_ready else None
+    if ranked_other is None:
+        ranked_other = rank_with_faiss(job, other_candidates, settings.top_k)
+
+    ranked = ranked_title + ranked_other
 
     # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
     # ranked reste trié par similarité d'embedding, pas par ce score.
     rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
-
-    # TEMPORAIRE -- diagnostic uniquement (2026-10-02), a retirer.
-    _debug_ranked_title_count = sum(
-        1 for cv, _ in ranked if getattr(cv.payload, "retrieval_channel", None) == "title"
-    )
 
     scored_items: List[ScoreItem] = []
     for rank, (cv, sim) in enumerate(ranked):
@@ -2509,11 +2525,6 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     if not scored_items and ranked:
         cv, sim = ranked[0]
         scored_items.append(build_score(job, cv, sim, 0, rerank_scores.get(cv.payload.id)))
-
-    # TEMPORAIRE -- diagnostic uniquement (2026-10-02), a retirer.
-    for _dbg_item in scored_items:
-        _dbg_item.extra["_debug_title_count"] = title_count
-        _dbg_item.extra["_debug_ranked_title_count"] = _debug_ranked_title_count
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en
