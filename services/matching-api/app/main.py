@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import extraction
 from app.db import get_engine, init_db
+from app.document_profile import build_document_profile
 from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk, JobScoringState
 from app.scoring import (
     CV_CHUNK_LIMIT,
@@ -1172,11 +1173,19 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
 
         for cv_id, text_value in to_embed:
             skills = sorted(find_skills(text_value))
+            # Faits lus dans le vrai texte (document_profile.py, portage
+            # AI Real-Time) -- remplacent les champs de formulaire WordPress
+            # utilisés jusqu'ici pour experience/contrat/langues côté CV.
+            profile = build_document_profile(text_value)
             stmt = pg_insert(CvEmbedding).values(
                 cv_id=cv_id,
                 content_hash=content_hash(text_value),
                 skills_canonical=skills,
                 text_content=text_value,
+                experience_years=profile.experience_years,
+                contract_type=profile.contract_type,
+                education_text=profile.education_text,
+                language_terms=profile.language_terms,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=[CvEmbedding.cv_id],
@@ -1184,6 +1193,10 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                     "content_hash": stmt.excluded.content_hash,
                     "skills_canonical": stmt.excluded.skills_canonical,
                     "text_content": stmt.excluded.text_content,
+                    "experience_years": stmt.excluded.experience_years,
+                    "contract_type": stmt.excluded.contract_type,
+                    "education_text": stmt.excluded.education_text,
+                    "language_terms": stmt.excluded.language_terms,
                     "updated_at": func.now(),
                 },
             )

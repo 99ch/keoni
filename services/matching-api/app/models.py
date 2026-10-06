@@ -97,6 +97,19 @@ class CvEmbedding(Base):
     # par /retrieve pour éviter à /score de re-extraire (OCR/Tika) un fichier
     # déjà traité. Voir db.py::ensure_pgvector_schema.
     text_content: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    # Faits lus dans le vrai texte du CV (document_profile.py, portage
+    # AI Real-Time, 2026-10-06), destinés à terme à remplacer les champs de
+    # formulaire WordPress (cv.metadata) que prepare_cv() lit aujourd'hui
+    # pour ces mêmes informations. Calculés et stockés ici (pilier
+    # Extraction) ; leur branchement dans prepare_cv()/le scoring est le
+    # travail du pilier Scoring (scoring.py), pas encore fait -- ces
+    # colonnes sont donc écrites mais pas encore lues ailleurs.
+    experience_years: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    contract_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    education_text: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    language_terms: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, server_default="{}"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
