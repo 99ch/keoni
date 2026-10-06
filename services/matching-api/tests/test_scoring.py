@@ -6,12 +6,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.scoring import (  # noqa: E402
+    CV_CHUNK_LIMIT,
     DEFAULT_WEIGHTS,
+    JOB_CHUNK_LIMIT,
     SCORING_PROFILES,
     SKILL_CAP_FLOOR,
     PreparedCv,
     PreparedJob,
     category_component,
+    chunk_text,
     compute_final_score,
     core_keyword_coverage,
     enrich_cv_skills,
@@ -539,3 +542,45 @@ def test_normalize_whitespace_strips_embedded_nul_bytes():
     raw = "Jean Dupont\x00 Développeur Python\x00"
     assert "\x00" not in normalize_whitespace(raw)
     assert normalize_whitespace(raw) == "Jean Dupont Développeur Python"
+
+
+# ── chunk_text / plafonds job vs CV (2026-10-06) ────────────────────────────
+#
+# Trouvé en comparant avec AI Real-Time : un CV au-delà de
+# CV_CHUNK_LIMIT * 800 caractères était tronqué en silence -- exactement
+# la classe de bug que le découpage par fenêtres était censé éliminer en
+# premier lieu (voir le commentaire au-dessus de JOB_CHUNK_LIMIT), juste
+# déplacée de la limite du modèle au plafond de fenêtres.
+
+
+def test_chunk_text_short_input_returns_a_single_chunk():
+    assert chunk_text("Développeur Python") == ["Développeur Python"]
+
+
+def test_chunk_text_empty_input_returns_a_single_empty_chunk():
+    assert chunk_text("") == [""]
+    assert chunk_text("   ") == [""]
+
+
+def test_chunk_text_does_not_drop_content_within_its_limit():
+    # 16 fenêtres de 800 car. (CV_CHUNK_LIMIT) = 12 800 car. couverts.
+    text = "x" * (CV_CHUNK_LIMIT * 800)
+    chunks = chunk_text(text, max_chunks=CV_CHUNK_LIMIT)
+    assert len(chunks) == CV_CHUNK_LIMIT
+    assert sum(len(c) for c in chunks) == len(text)
+
+
+def test_chunk_text_still_truncates_beyond_the_given_limit():
+    # Le plafond protège toujours contre un texte pathologiquement long --
+    # ce test verrouille qu'il existe bien une limite, pas qu'elle est
+    # illimitée.
+    text = "x" * (CV_CHUNK_LIMIT * 800 + 1)
+    chunks = chunk_text(text, max_chunks=CV_CHUNK_LIMIT)
+    assert len(chunks) == CV_CHUNK_LIMIT
+    assert sum(len(c) for c in chunks) == CV_CHUNK_LIMIT * 800
+
+
+def test_cv_chunk_limit_is_strictly_more_generous_than_job_chunk_limit():
+    # Une offre dépasse rarement 1-2 pages, un CV peut en faire 4-5 --
+    # voir le commentaire sur JOB_CHUNK_LIMIT/CV_CHUNK_LIMIT.
+    assert CV_CHUNK_LIMIT > JOB_CHUNK_LIMIT

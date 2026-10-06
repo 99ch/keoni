@@ -147,6 +147,34 @@ def overlap_text(a: str, b: str) -> bool:
     return bool(tokenize(a) & tokenize(b))
 
 
+# 800 car./fenêtre mesuré empiriquement contre le tokenizer réel de
+# intfloat/multilingual-e5-base : ~226 tokens pour 800 car. de texte CV/
+# offre en français (ratio ~3,5 car./token), confortablement sous la
+# limite du modèle (512 tokens) -- la TAILLE de fenêtre n'est pas le
+# risque de troncature, le PLAFOND de fenêtres l'est.
+#
+# Plafond asymétrique job/CV, pas un seul plafond partagé : une offre
+# dépasse rarement 1-2 pages, un CV peut en faire 4-5. Un plafond unique
+# à 8 (6 400 car.) coupait en silence tout CV au-delà -- exactement la
+# classe de bug que le découpage par fenêtres était censé éliminer (voir
+# main.py, reindex_cv_batch/score_job), juste déplacée de la limite du
+# modèle (512 tokens, ~1 800 car.) à celle du plafond de fenêtres. Le
+# plafond CV reste volontairement raisonnable (pas "illimité") car le
+# cross-encoder pair les fenêtres query x document (main.py::
+# cross_encode_best) : seul le côté CV grandit, donc le nombre de paires
+# ne croît que linéairement avec ce plafond, jamais au carré.
+JOB_CHUNK_LIMIT = 8
+CV_CHUNK_LIMIT = 16
+
+
+def chunk_text(value: str, max_chars: int = 800, max_chunks: int = 8) -> list[str]:
+    value = value.strip()
+    if not value:
+        return [""]
+    chunks = [value[i : i + max_chars] for i in range(0, len(value), max_chars)]
+    return chunks[:max_chunks] or [""]
+
+
 @dataclass(slots=True)
 class PreparedJob:
     text: str

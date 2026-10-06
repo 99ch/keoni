@@ -34,10 +34,13 @@ from app import extraction
 from app.db import get_engine, init_db
 from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk, JobScoringState
 from app.scoring import (
+    CV_CHUNK_LIMIT,
     DEFAULT_WEIGHTS,
+    JOB_CHUNK_LIMIT,
     PreparedCv,
     PreparedJob,
     ScoreResult,
+    chunk_text,
     compute_final_score,
     get_skill_embedding_tuning,
     normalize_whitespace,
@@ -1158,7 +1161,7 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
         chunk_refs: List[Tuple[int, int]] = []
         flattened_texts: List[str] = []
         for cv_id, text_value in to_embed:
-            for chunk_index, chunk in enumerate(chunk_text(text_value)):
+            for chunk_index, chunk in enumerate(chunk_text(text_value, max_chunks=CV_CHUNK_LIMIT)):
                 chunk_refs.append((cv_id, chunk_index))
                 flattened_texts.append(embedding_text(chunk, "passage"))
 
@@ -1555,14 +1558,6 @@ def get_cross_encoder() -> Optional[CrossEncoder]:
     return _cross_encoder
 
 
-def chunk_text(value: str, max_chars: int = 800, max_chunks: int = 8) -> List[str]:
-    value = value.strip()
-    if not value:
-        return [""]
-    chunks = [value[i : i + max_chars] for i in range(0, len(value), max_chars)]
-    return chunks[:max_chunks] or [""]
-
-
 def find_cv_ids_by_job_chunks(conn, job_chunk_vectors, limit: int, cv_ids: Optional[List[int]] = None):
     """Union de toutes les paires (fenêtre d'offre x fenêtre de CV),
     regroupée par cv_id avec la distance MINIMALE -- la meilleure fenêtre
@@ -1590,16 +1585,22 @@ def find_cv_ids_by_job_chunks(conn, job_chunk_vectors, limit: int, cv_ids: Optio
 def cross_encode_best(query: str, document: str) -> float:
     """Score sémantique fin d'une paire (offre, CV), 0-1 (sigmoïde du logit brut).
 
-    Les deux textes sont découpés en fenêtres de ≤800 caractères (8 max
-    chacun) pour rester robuste sur les CV longs ; on garde la meilleure
-    paire de fenêtres plutôt qu'une moyenne, pour ne pas diluer un bon match
-    localisé dans un texte par ailleurs peu pertinent.
+    Les deux textes sont découpés en fenêtres de ≤800 caractères
+    (JOB_CHUNK_LIMIT côté offre, CV_CHUNK_LIMIT côté CV -- voir
+    app/scoring.py::chunk_text()) pour rester robuste sur les CV longs ;
+    on garde la meilleure paire de fenêtres plutôt qu'une moyenne, pour
+    ne pas diluer un bon match localisé dans un texte par ailleurs peu
+    pertinent.
     """
     model = get_cross_encoder()
     if model is None:
         return 0.5
 
-    pairs = [(q, d) for q in chunk_text(query) for d in chunk_text(document)]
+    pairs = [
+        (q, d)
+        for q in chunk_text(query, max_chunks=JOB_CHUNK_LIMIT)
+        for d in chunk_text(document, max_chunks=CV_CHUNK_LIMIT)
+    ]
 
     try:
         raw_scores = model.predict(pairs)
@@ -1795,7 +1796,7 @@ def rank_with_pgvector(
                 # toute l'offre -- une offre longue (plusieurs sections
                 # concaténées par prepare_job()) tronquait sinon en silence
                 # le vecteur de requête utilisé pour la recherche initiale.
-                job_chunks = chunk_text(job.text)
+                job_chunks = chunk_text(job.text, max_chunks=JOB_CHUNK_LIMIT)
                 job_chunk_vectors = encode_texts([embedding_text(c, "query") for c in job_chunks])
 
                 job_stmt = pg_insert(JobEmbedding).values(job_id=job_id, content_hash=job_text_hash)
@@ -1840,7 +1841,9 @@ def rank_with_pgvector(
                 chunk_refs: List[Tuple[int, int]] = []
                 flattened_texts: List[str] = []
                 for cv_id in stale_ids:
-                    for chunk_index, chunk in enumerate(chunk_text(candidates_by_id[cv_id].text)):
+                    for chunk_index, chunk in enumerate(
+                        chunk_text(candidates_by_id[cv_id].text, max_chunks=CV_CHUNK_LIMIT)
+                    ):
                         chunk_refs.append((cv_id, chunk_index))
                         flattened_texts.append(embedding_text(chunk, "passage"))
 
@@ -2386,7 +2389,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     # Un embedding par fenêtre de texte d'offre, pas un seul pour toute
     # l'offre -- voir le commentaire sur JobEmbeddingChunk (models.py).
     job_chunk_vectors = encode_texts(
-        [embedding_text(c, "query") for c in chunk_text(prepared_job.text)]
+        [embedding_text(c, "query") for c in chunk_text(prepared_job.text, max_chunks=JOB_CHUNK_LIMIT)]
     )
     required_skills = sorted(prepared_job.skills_canonical)
     title_ids = fetch_wp_resume_ids_by_title(job.title or "")
