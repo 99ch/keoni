@@ -55,6 +55,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, List, Optional, Sequence, Tuple, Union
 
+from app.document_profile import _fold as _document_fold
 from app.taxonomy import find_skills, normalize_skill
 
 WORD_PATTERN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+")
@@ -144,14 +145,6 @@ def tokenize(text: str) -> set[str]:
     return tokens
 
 
-def overlap_text(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
-    if a in b or b in a:
-        return True
-    return bool(tokenize(a) & tokenize(b))
-
-
 # 800 car./fenêtre mesuré empiriquement contre le tokenizer réel de
 # intfloat/multilingual-e5-base : ~226 tokens pour 800 car. de texte CV/
 # offre en français (ratio ~3,5 car./token), confortablement sous la
@@ -188,12 +181,7 @@ class PreparedJob:
     keywords: List[str]
     keyword_set: set[str]
     skills_canonical: set[str]
-    location: str
-    category: str
-    jobtype: str
     min_experience_years: Optional[float]
-    salary_min: Optional[float]
-    salary_max: Optional[float]
     title: str = ""
     # Termes bruts du champ "keywords", répétitions conservées, puces/entête
     # nettoyées -- alimente à la fois priority_keyword_component et
@@ -202,6 +190,14 @@ class PreparedJob:
     # Preset de pondération recruteur (JobPayload.scoring_profile /
     # job.meta["scoring_profile"]), ou None pour le défaut plateforme.
     scoring_profile: Optional[str] = None
+    # Lus dans le vrai texte de l'offre (document_profile.build_document_
+    # profile, portage AI Real-Time) -- remplacent location/category/jobtype/
+    # salary_min/salary_max/qualification (2026-10-06, pilier Scoring) :
+    # ces 5 champs comparaient des cases de formulaire WordPress sans aucun
+    # équivalent chez rhconsole, supprimés plutôt que remplacés un par un.
+    education_text: str = ""
+    language_terms: List[str] = field(default_factory=list)
+    contract_type: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -213,13 +209,13 @@ class PreparedCv:
     keywords: List[str]
     keyword_set: set[str]
     skills_canonical: set[str]
-    location: str
-    category: str
-    jobtype: str
     experience_years: Optional[float]
-    salary_expected_min: Optional[float]
-    salary_expected_max: Optional[float]
-    qualified: Optional[bool]
+    # Lus dans le vrai texte du CV (document_profile.build_document_profile,
+    # stockés sur CvEmbedding par le pilier Extraction) -- mêmes raisons que
+    # côté PreparedJob ci-dessus.
+    education_text: str = ""
+    language_terms: List[str] = field(default_factory=list)
+    contract_type: Optional[str] = None
 
 
 # ── Poids ──────────────────────────────────────────────────────────────────
@@ -227,29 +223,24 @@ class PreparedCv:
 # Valeurs IDENTIQUES à _DEFAULT_W chez AI Real-Time (semantic=0.10,
 # skills=0.40, priority_keywords=0.40, experience=0.20, education=0.08,
 # languages=0.05, contract=0.05) -- alignement exact demandé pour comparer
-# les scores entre les deux plateformes sur un même CV/offre (2026-09-28).
-# Keoni n'a pas de composantes education/languages séparées, remplacées ici
-# par category/location au même poids : signaux structurels du même ordre
-# d'importance secondaire, mais PAS la même donnée sous-jacente
-# (category/location comparent des champs de formulaire WP, pas une
-# section formation/langues extraite du CV -- voir skills_component et les
-# fonctions de composante ci-dessous). `salary` et `qualification`
-# n'existent pas chez AI Real-Time (pas de notion de prétention salariale
-# ni de "qualifié déclaré" dans leur modèle) : gardés à poids NUL pour que
-# leur sous-score reste visible dans le détail (explication candidat) sans
-# influencer le score final -- un poids nul retire exactement leur
-# contribution de la moyenne pondérée (voir compute_final_score), ce qui
-# équivaut à les exclure du calcul sans perdre l'information affichée.
+# les scores entre les deux plateformes sur un même CV/offre (2026-09-28,
+# composantes complétées 2026-10-06 : jobtype/category/location/salary/
+# qualification n'avaient AUCUN équivalent chez rhconsole -- elles
+# comparaient des cases de formulaire WordPress remplies par le candidat
+# (type de contrat déclaré, catégorie de poste, ville, prétention salariale,
+# "qualifié" déclaré), jamais le vrai texte du CV/de l'offre. Supprimées et
+# remplacées par education/languages/contract, les 3 composantes réelles de
+# rhconsole, qui comparent le texte effectivement extrait du document (voir
+# document_profile.py, pilier Extraction) -- pas de simple renommage, un
+# changement de nature de la donnée comparée.
 DEFAULT_WEIGHTS: dict[str, float] = {
     "semantic": 0.10,
     "skills": 0.40,
     "keywords": 0.40,
     "experience": 0.20,
-    "jobtype": 0.05,
-    "category": 0.08,
-    "location": 0.05,
-    "salary": 0.0,
-    "qualification": 0.0,
+    "education": 0.08,
+    "languages": 0.05,
+    "contract": 0.05,
 }
 
 # Presets nommés, portage de _SCORING_PROFILES côté AI Real-Time : un
@@ -713,34 +704,50 @@ def experience_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool,
     return raw, True, job_y
 
 
-def jobtype_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
-    if not job.jobtype or not cv.jobtype:
+_EDUCATION_STOPWORDS = {"les", "des", "une", "the", "and", "for", "with", "dans", "de", "du"}
+_EDUCATION_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+
+
+def education_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
+    """Portage verbatim de _education_score côté AI Real-Time : recouvrement
+    (Jaccard) des mots de la section formation, lue dans le vrai texte des
+    deux côtés (document_profile.py) -- plus de comparaison de "catégorie"
+    de formulaire WordPress."""
+    if not cv.education_text or not job.education_text:
         return 0.5, False
-    return (1.0 if overlap_text(job.jobtype, cv.jobtype) else 0.0), True
 
+    def tokens(value: str) -> set[str]:
+        return set(_EDUCATION_TOKEN_RE.findall(_document_fold(value))) - _EDUCATION_STOPWORDS
 
-def category_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
-    if not job.category or not cv.category:
+    cv_t, job_t = tokens(cv.education_text), tokens(job.education_text)
+    if not cv_t or not job_t:
         return 0.5, False
-    return (1.0 if overlap_text(job.category, cv.category) else 0.0), True
+    return len(cv_t & job_t) / len(cv_t | job_t), True
 
 
-def location_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
-    if not job.location or not cv.location:
+def language_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
+    """Portage verbatim de _language_score côté AI Real-Time : couverture
+    des langues requises par l'offre, trouvées dans le vrai texte du CV
+    (document_profile.py) -- plus de comparaison de "ville" de formulaire."""
+    job_langs = set(job.language_terms)
+    if not job_langs:
         return 0.5, False
-    return (1.0 if (job.location in cv.location or cv.location in job.location) else 0.0), True
+    cv_langs = set(cv.language_terms)
+    if not cv_langs:
+        return 0.3, False
+    return len(cv_langs & job_langs) / len(job_langs), True
 
 
-def salary_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
-    if job.salary_max is None or cv.salary_expected_min is None:
+def contract_component(job: PreparedJob, cv: PreparedCv) -> Tuple[float, bool]:
+    """Portage verbatim de _contract_score côté AI Real-Time : égalité
+    stricte du type de contrat lu dans le vrai texte des deux côtés
+    (document_profile.py) -- plus de comparaison floue de "type de contrat"
+    de formulaire WordPress (overlap_text)."""
+    if not job.contract_type:
         return 0.5, False
-    return (1.0 if cv.salary_expected_min <= job.salary_max else 0.0), True
-
-
-def qualification_component(cv: PreparedCv) -> Tuple[float, bool]:
-    if cv.qualified is None:
-        return 0.5, False
-    return (1.0 if cv.qualified else 0.0), True
+    if not cv.contract_type:
+        return 0.4, False
+    return (1.0 if cv.contract_type == job.contract_type else 0.0), True
 
 
 @dataclass(slots=True)
@@ -794,21 +801,17 @@ def compute_final_score(
         job, effective_cv_skills, semantic_skill_credit_fn
     )
     experience_val, experience_ok, experience_required_years = experience_component(job, cv)
-    jobtype_val, jobtype_ok = jobtype_component(job, cv)
-    category_val, category_ok = category_component(job, cv)
-    location_val, location_ok = location_component(job, cv)
-    salary_val, salary_ok = salary_component(job, cv)
-    qualification_val, qualification_ok = qualification_component(cv)
+    education_val, education_ok = education_component(job, cv)
+    languages_val, languages_ok = language_component(job, cv)
+    contract_val, contract_ok = contract_component(job, cv)
 
     structured = (
         ("skills", skills_val, skills_ok),
         ("keywords", keywords_val, keywords_ok),
         ("experience", experience_val, experience_ok),
-        ("jobtype", jobtype_val, jobtype_ok),
-        ("category", category_val, category_ok),
-        ("location", location_val, location_ok),
-        ("salary", salary_val, salary_ok),
-        ("qualification", qualification_val, qualification_ok),
+        ("education", education_val, education_ok),
+        ("languages", languages_val, languages_ok),
+        ("contract", contract_val, contract_ok),
     )
 
     weighted_sum = w["semantic"] * semantic
@@ -840,11 +843,9 @@ def compute_final_score(
         "skills": round(skills_val, 4) if skills_ok else None,
         "keywords": round(keywords_val, 4) if keywords_ok else None,
         "experience": round(experience_val, 4) if experience_ok else None,
-        "jobtype": round(jobtype_val, 4) if jobtype_ok else None,
-        "category": round(category_val, 4) if category_ok else None,
-        "location": round(location_val, 4) if location_ok else None,
-        "salary": round(salary_val, 4) if salary_ok else None,
-        "qualification": round(qualification_val, 4) if qualification_ok else None,
+        "education": round(education_val, 4) if education_ok else None,
+        "languages": round(languages_val, 4) if languages_ok else None,
+        "contract": round(contract_val, 4) if contract_ok else None,
         "core_keyword_coverage": round(core_coverage, 4),
         "experience_required_years": experience_required_years,
     }

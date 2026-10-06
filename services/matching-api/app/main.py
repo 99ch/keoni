@@ -45,7 +45,6 @@ from app.scoring import (
     compute_final_score,
     get_skill_embedding_tuning,
     normalize_whitespace,
-    overlap_text,
     strip_html,
     set_skill_embedding_tuning,
     split_priority_keyword_terms,
@@ -72,13 +71,12 @@ class Settings:
     w_skills: float = float(os.getenv("MATCHING_W_SKILLS", str(DEFAULT_WEIGHTS["skills"])))
     w_keywords: float = float(os.getenv("MATCHING_W_KEYWORDS", str(DEFAULT_WEIGHTS["keywords"])))
     w_experience: float = float(os.getenv("MATCHING_W_EXPERIENCE", str(DEFAULT_WEIGHTS["experience"])))
-    w_jobtype: float = float(os.getenv("MATCHING_W_JOBTYPE", str(DEFAULT_WEIGHTS["jobtype"])))
-    w_category: float = float(os.getenv("MATCHING_W_CATEGORY", str(DEFAULT_WEIGHTS["category"])))
-    w_location: float = float(os.getenv("MATCHING_W_LOCATION", str(DEFAULT_WEIGHTS["location"])))
-    w_salary: float = float(os.getenv("MATCHING_W_SALARY", str(DEFAULT_WEIGHTS["salary"])))
-    w_qualification: float = float(os.getenv("MATCHING_W_QUALIFICATION", str(DEFAULT_WEIGHTS["qualification"])))
-    hard_filter_jobtype: bool = os.getenv("MATCHING_HARD_FILTER_JOBTYPE", "1") == "1"
-    hard_filter_qualification: bool = os.getenv("MATCHING_HARD_FILTER_QUALIFICATION", "1") == "1"
+    # education/languages/contract (2026-10-06, pilier Scoring) : remplacent
+    # jobtype/category/location/salary/qualification, qui comparaient des
+    # cases de formulaire WordPress sans aucun équivalent chez rhconsole.
+    w_education: float = float(os.getenv("MATCHING_W_EDUCATION", str(DEFAULT_WEIGHTS["education"])))
+    w_languages: float = float(os.getenv("MATCHING_W_LANGUAGES", str(DEFAULT_WEIGHTS["languages"])))
+    w_contract: float = float(os.getenv("MATCHING_W_CONTRACT", str(DEFAULT_WEIGHTS["contract"])))
     # 64 plutôt que 32 : moins d'appels/overhead Python par lot sur CPU pour
     # le réindex complet (lots de reindex_page_size=100 textes) ; sans effet
     # sur /score en usage normal (nombre de CV par offre très inférieur à
@@ -364,6 +362,17 @@ class CvPayload(BaseModel):
     # /score-fast pour éviter de re-télécharger/re-extraire (OCR/Tika) le
     # fichier à chaque appel. Jamais rempli depuis le payload WordPress brut.
     cached_extracted_text: Optional[str] = None
+    # Faits lus dans le vrai texte du CV lors d'un réindex précédent
+    # (CvEmbedding.experience_years/contract_type/education_text/
+    # language_terms -- document_profile.py, pilier Extraction), injectés
+    # par /retrieve pour éviter de relire tout le texte à chaque appel --
+    # même principe que cached_extracted_text ci-dessus. None pour un CV pas
+    # encore réindexé : prepare_cv() calcule alors à la volée (voir son
+    # commentaire), jamais de repli sur un champ de formulaire WordPress.
+    cached_experience_years: Optional[int] = None
+    cached_contract_type: Optional[str] = None
+    cached_education_text: Optional[str] = None
+    cached_language_terms: Optional[List[str]] = None
     # "title" (correspondance stricte de titre, ex-L1 n8n) ou "similar"
     # (retenu par le canal sémantique/taxonomie uniquement) -- injecté par
     # retrieve() (voir son commentaire), jamais fourni par un appelant.
@@ -521,35 +530,6 @@ def parse_float(value: Optional[object]) -> Optional[float]:
         return None
 
 
-def parse_range(value: Optional[object]) -> Tuple[Optional[float], Optional[float]]:
-    if value is None:
-        return None, None
-    text = str(value).strip().replace(",", ".")
-    if not text:
-        return None, None
-    numbers = [float(m) for m in re.findall(r"\d+(?:\.\d+)?", text)]
-    if not numbers:
-        return None, None
-    if len(numbers) == 1:
-        return numbers[0], numbers[0]
-    return min(numbers), max(numbers)
-
-
-def parse_boolish(value: Optional[object]) -> Optional[bool]:
-    if value is None:
-        return None
-    text = normalized_text(value)
-    if not text:
-        return None
-    yes_values = {"yes", "oui", "true", "1", "qualifie", "qualifié", "ok"}
-    no_values = {"no", "non", "false", "0", "ko"}
-    if text in yes_values:
-        return True
-    if text in no_values:
-        return False
-    return None
-
-
 def find_first(source: dict, keys: Sequence[str]) -> Optional[object]:
     for key in keys:
         if key in source and source.get(key) not in (None, ""):
@@ -661,19 +641,38 @@ def assemble_cv_text(cv: CvPayload) -> str:
     return ""
 
 
-def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, str]:
-    """Texte déjà extrait du vrai fichier CV lors d'un réindex précédent
-    (CvEmbedding.text_content) -- à injecter dans CvPayload.cached_extracted_text
-    (jamais dans text_content/resume/skills, voir assemble_cv_text()) pour
-    que /retrieve et /score-fast évitent de re-télécharger/re-extraire le
-    fichier à chaque appel. Un cv_id absent du résultat (jamais réindexé)
-    retombe simplement sur l'extraction à la volée côté assemble_cv_text()."""
+def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, dict]:
+    """Texte + faits déjà extraits du vrai fichier CV lors d'un réindex
+    précédent (CvEmbedding.text_content/experience_years/contract_type/
+    education_text/language_terms) -- à injecter dans les champs cached_*
+    de CvPayload pour que /retrieve et /score-fast évitent de re-télécharger/
+    re-extraire (OCR/Tika) et de relire (document_profile.py) le fichier à
+    chaque appel. Un cv_id absent du résultat (jamais réindexé) retombe
+    simplement sur l'extraction à la volée côté assemble_cv_text()/
+    prepare_cv()."""
     if not cv_ids:
         return {}
     rows = conn.execute(
-        select(CvEmbedding.cv_id, CvEmbedding.text_content).where(CvEmbedding.cv_id.in_(cv_ids))
+        select(
+            CvEmbedding.cv_id,
+            CvEmbedding.text_content,
+            CvEmbedding.experience_years,
+            CvEmbedding.contract_type,
+            CvEmbedding.education_text,
+            CvEmbedding.language_terms,
+        ).where(CvEmbedding.cv_id.in_(cv_ids))
     ).all()
-    return {row.cv_id: row.text_content for row in rows if row.text_content}
+    return {
+        row.cv_id: {
+            "text_content": row.text_content,
+            "experience_years": row.experience_years,
+            "contract_type": row.contract_type,
+            "education_text": row.education_text,
+            "language_terms": row.language_terms,
+        }
+        for row in rows
+        if row.text_content
+    }
 
 
 def prepare_job(job: JobPayload) -> PreparedJob:
@@ -695,14 +694,16 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     # la présence de mots. Repli sur `text` si les champs naturels sont vides.
     semantic_parts = [job.title, description, content, excerpt]
     semantic_text = normalize_whitespace(" ".join(filter(None, semantic_parts))) or text
-    location = (job.location or meta.get("location") or "").lower()
     tokens = tokenize(f"{job.title} {description}")
-    category = normalized_text(find_first(meta, ["jobcategory_text", "category_text", "job_category", "category"]))
-    jobtype = normalized_text(find_first(meta, ["jobtype_text", "job_type", "type", "jobtype"]))
     min_experience_years = parse_float(find_first(meta, ["experience", "min_experience", "required_experience"]))
 
-    salary_min = parse_float(find_first(meta, ["salaryfrom", "salary_min", "salary_from"]))
-    salary_max = parse_float(find_first(meta, ["salaryto", "salary_max", "salary_to", "tjm", "salary"]))
+    # Formation/langues/contrat lus dans le vrai texte de l'offre (document_
+    # profile.py, portage AI Real-Time) -- remplacent category/location/
+    # jobtype/salary, qui comparaient des cases de formulaire WordPress sans
+    # équivalent chez rhconsole (2026-10-06, pilier Scoring). Calculé à la
+    # volée comme le reste de prepare_job (pas de stockage persistant côté
+    # offre, cohérent avec l'existant).
+    document_profile = build_document_profile(text)
 
     # job.keywords brut (avant dédup) alimente PUREMENT le mécanisme
     # "mots-clés prioritaires" (couverture + pénalité core-keyword) -- voir
@@ -722,21 +723,18 @@ def prepare_job(job: JobPayload) -> PreparedJob:
         keywords=keywords,
         keyword_set=set(keywords),
         skills_canonical=set(find_skills(text)),
-        location=location,
-        category=category,
-        jobtype=jobtype,
         min_experience_years=min_experience_years,
-        salary_min=salary_min,
-        salary_max=salary_max,
         title=job.title or "",
         keyword_terms_raw=keyword_terms_raw,
         scoring_profile=scoring_profile,
+        education_text=document_profile.education_text,
+        language_terms=document_profile.language_terms,
+        contract_type=document_profile.contract_type,
     )
 
 
 def prepare_cv(cv: CvPayload) -> PreparedCv:
     meta = cv.metadata or {}
-    raw = cv.model_dump()
     text = assemble_cv_text(cv)
     text_tokens = tokenize(text) if text else set()
     title_tokens = tokenize(" ".join(filter(None, [cv.application_title, cv.title])))
@@ -744,23 +742,26 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
     # utilisé pour le scoring (voir assemble_cv_text()).
     keywords = parse_keywords(cv.keywords) + parse_keywords(meta.get("keywords"))
     keywords = list(dict.fromkeys(keywords))
-    location = (cv.location or meta.get("location") or "").lower()
 
-    category = normalized_text(
-        find_first(raw, ["category_text", "category", "job_category"]) or find_first(meta, ["category_text", "category", "job_category"])
-    )
-    jobtype = normalized_text(
-        find_first(raw, ["job_type", "type", "jobtype", "jobtype_text"]) or find_first(meta, ["job_type", "type", "jobtype", "jobtype_text"])
-    )
-    experience_years = parse_float(
-        find_first(raw, ["total_experience", "experience", "experience_years"]) or find_first(meta, ["total_experience", "experience", "experience_years"])
-    )
-    salary_min, salary_max = parse_range(
-        find_first(raw, ["salary_requested", "salary", "salary_range", "expected_salary", "tjm"]) or find_first(meta, ["salary_requested", "salary", "salary_range", "expected_salary", "tjm"])
-    )
-    qualified = parse_boolish(
-        find_first(raw, ["qualified_for_job", "qualified", "qualifie", "qualifié"]) or find_first(meta, ["qualified_for_job", "qualified", "qualifie", "qualifié"])
-    )
+    # Expérience/formation/langues/contrat lus dans le vrai texte du CV
+    # (document_profile.py, portage AI Real-Time) -- remplacent category/
+    # location/jobtype/salary/qualification, qui comparaient des cases de
+    # formulaire WordPress sans équivalent chez rhconsole (2026-10-06,
+    # pilier Scoring). cached_* vient d'un réindex précédent (voir
+    # fetch_cached_cv_text/reindex_cv_batch) pour éviter de relire tout le
+    # texte à chaque appel ; repli sur un calcul à la volée pour un CV pas
+    # encore réindexé -- jamais de repli sur un champ de formulaire.
+    if cv.cached_experience_years is not None:
+        experience_years: Optional[float] = float(cv.cached_experience_years)
+        education_text = cv.cached_education_text or ""
+        language_terms = list(cv.cached_language_terms or [])
+        contract_type = cv.cached_contract_type
+    else:
+        document_profile = build_document_profile(text)
+        experience_years = float(document_profile.experience_years)
+        education_text = document_profile.education_text
+        language_terms = document_profile.language_terms
+        contract_type = document_profile.contract_type
 
     return PreparedCv(
         payload=cv,
@@ -770,30 +771,13 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
         keywords=keywords,
         keyword_set=set(keywords),
         skills_canonical=set(find_skills(text)),
-        location=location,
-        category=category,
-        jobtype=jobtype,
         experience_years=experience_years,
-        salary_expected_min=salary_min,
-        salary_expected_max=salary_max,
-        qualified=qualified,
+        education_text=education_text,
+        language_terms=language_terms,
+        contract_type=contract_type,
     )
 
 
-def passes_hard_filters(job: PreparedJob, cv: PreparedCv) -> Tuple[bool, List[str]]:
-    reasons: List[str] = []
-
-    if settings.hard_filter_qualification and cv.qualified is False:
-        reasons.append("Candidat non qualifié pour le poste")
-
-    if settings.hard_filter_jobtype and job.jobtype and cv.jobtype and not overlap_text(job.jobtype, cv.jobtype):
-        reasons.append("Type de contrat incompatible")
-
-    if job.min_experience_years is not None and cv.experience_years is not None:
-        if cv.experience_years + 0.5 < job.min_experience_years:
-            reasons.append("Expérience insuffisante")
-
-    return len(reasons) == 0, reasons
 
 
 def encode_texts(texts: Sequence[str]) -> np.ndarray:
@@ -1028,6 +1012,10 @@ def resume_to_cv_payload(resume: dict) -> "CvPayload":
         candidate_email=resume.get("email") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
         cached_extracted_text=resume.get("cached_extracted_text") or None,
+        cached_experience_years=resume.get("cached_experience_years"),
+        cached_contract_type=resume.get("cached_contract_type") or None,
+        cached_education_text=resume.get("cached_education_text") or None,
+        cached_language_terms=resume.get("cached_language_terms") or None,
         retrieval_channel=resume.get("retrieval_channel") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
@@ -1909,11 +1897,9 @@ def base_weights() -> dict[str, float]:
         "skills": settings.w_skills,
         "keywords": settings.w_keywords,
         "experience": settings.w_experience,
-        "jobtype": settings.w_jobtype,
-        "category": settings.w_category,
-        "location": settings.w_location,
-        "salary": settings.w_salary,
-        "qualification": settings.w_qualification,
+        "education": settings.w_education,
+        "languages": settings.w_languages,
+        "contract": settings.w_contract,
     }
 
 
@@ -2021,24 +2007,6 @@ def build_score(
     if title_overlap:
         strengths.append(f"Titre proche ({', '.join(sorted(title_overlap)[:3])})")
 
-    if "qualification" not in low:
-        if cv.qualified:
-            strengths.append("Profil déclaré qualifié pour le poste")
-        else:
-            weaknesses.append("Profil déclaré non qualifié")
-
-    if "jobtype" not in low:
-        if result.breakdown["jobtype"] == 1.0:
-            strengths.append("Type de contrat compatible")
-        else:
-            weaknesses.append("Type de contrat différent")
-
-    if "category" not in low:
-        if result.breakdown["category"] == 1.0:
-            strengths.append("Catégorie métier alignée")
-        else:
-            weaknesses.append("Catégorie métier différente")
-
     if "experience" not in low:
         # required_years peut venir d'une inférence de séniorité (titre de
         # l'offre) plutôt que d'une durée explicite -- job.min_experience_years
@@ -2050,17 +2018,23 @@ def build_score(
             required_label = f"{required_years:g}" if required_years is not None else "?"
             weaknesses.append(f"Expérience détectée : {cv.experience_years:g} ans pour {required_label} requis.")
 
-    if "salary" not in low:
-        if result.breakdown["salary"] == 1.0:
-            strengths.append("Prétention salariale compatible")
+    if "contract" not in low:
+        if result.breakdown["contract"] == 1.0:
+            strengths.append("Type de contrat compatible")
         else:
-            weaknesses.append("Prétention salariale au-dessus du budget")
+            weaknesses.append("Type de contrat différent")
 
-    if "location" not in low:
-        if result.breakdown["location"] == 1.0:
-            strengths.append("Localisation compatible")
+    if "education" not in low:
+        if result.breakdown["education"] and result.breakdown["education"] >= 0.5:
+            strengths.append("Formation alignée avec l'offre")
         else:
-            weaknesses.append("Localisation différente")
+            weaknesses.append("Formation peu alignée avec l'offre")
+
+    if "languages" not in low:
+        if result.breakdown["languages"] == 1.0:
+            strengths.append("Langues requises toutes couvertes")
+        else:
+            weaknesses.append("Certaines langues requises ne sont pas couvertes")
 
     # Phrase de synthèse (même esprit que le paragraphe d'introduction
     # d'AI Real-Time : quelles sections ont un vrai signal + mots-clés
@@ -2069,11 +2043,9 @@ def build_score(
         "skills": "compétences",
         "keywords": "mots-clés",
         "experience": "expérience",
-        "jobtype": "type de contrat",
-        "category": "catégorie",
-        "location": "localisation",
-        "salary": "salaire",
-        "qualification": "qualification",
+        "education": "formation",
+        "languages": "langues",
+        "contract": "type de contrat",
     }
     present_sections = [
         label for key, label in _component_labels_fr.items() if key not in low
@@ -2104,12 +2076,9 @@ def build_score(
         "excerpts_job": excerpts_job,
         "scoring_profile": job.scoring_profile,
         "rank": rank + 1,
-        "cv_category": cv.category,
-        "cv_jobtype": cv.jobtype,
         "cv_experience_years": cv.experience_years,
-        "cv_salary_min": cv.salary_expected_min,
-        "cv_salary_max": cv.salary_expected_max,
-        "cv_qualified": cv.qualified,
+        "cv_contract_type": cv.contract_type,
+        "cv_language_terms": cv.language_terms,
         "weights": result.weights,
         "score_breakdown": result.breakdown,
         "low_confidence_components": result.low_confidence_components,
@@ -2443,9 +2412,13 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     cvs = fetch_wp_resumes_by_ids(combined_ids)
     for cv in cvs:
         cv_id = cv.get("id")
-        cached_text = cached_text_by_id.get(cv_id)
-        if cached_text:
-            cv["cached_extracted_text"] = cached_text
+        cached = cached_text_by_id.get(cv_id)
+        if cached:
+            cv["cached_extracted_text"] = cached["text_content"]
+            cv["cached_experience_years"] = cached["experience_years"]
+            cv["cached_contract_type"] = cached["contract_type"]
+            cv["cached_education_text"] = cached["education_text"]
+            cv["cached_language_terms"] = cached["language_terms"]
         cv["retrieval_channel"] = channel_by_id.get(cv_id, "similar")
 
     return {
@@ -2477,13 +2450,14 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     if not usable:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour les CV")
 
-    filtered_usable: List[PreparedCv] = []
-    for cv in usable:
-        ok, _ = passes_hard_filters(job, cv)
-        if ok:
-            filtered_usable.append(cv)
-
-    candidates = filtered_usable if filtered_usable else usable
+    # Plus de filtre dur ici (passes_hard_filters, supprimé 2026-10-06,
+    # pilier Scoring) : comparait des cases de formulaire WordPress
+    # (qualifié/type de contrat/expérience) pour exclure un candidat avant
+    # même le scoring -- décision actée côté pilier Sélection ("tout CV avec
+    # un document réel est évalué, sans exception"), exécutée ici par
+    # nécessité mécanique (ces champs n'existent plus sur PreparedJob/
+    # PreparedCv).
+    candidates = usable
 
     # Les candidats du canal "titre" (retrieve(), voir CvPayload.retrieval_
     # channel) ne doivent jamais se faire évincer par la coupe top_k sur la
