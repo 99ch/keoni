@@ -247,6 +247,33 @@ def test_core_keyword_coverage_title_mention_counts_as_core():
     assert coverage_present == 1.0
 
 
+def test_core_keyword_coverage_semantic_credit_raises_partial_score():
+    """2026-10-06 (portage AI Real-Time) : un mot-clé coeur non matché
+    littéralement peut recevoir un crédit partiel via semantic_credit_fn,
+    au lieu de compter comme totalement absent."""
+    job = make_job(keyword_terms_raw=["SAS", "SAS", "SAS", "Excel"], title="Data Analyst")
+    coverage = core_keyword_coverage(
+        job, frozenset({"Excel"}), semantic_credit_fn=lambda unmatched, cv_skills: 0.4
+    )
+    assert coverage == pytest.approx(0.4)
+
+
+def test_core_keyword_coverage_semantic_credit_never_exceeds_one():
+    job = make_job(keyword_terms_raw=["SAS", "SAS", "SAS"], title="Data Analyst")
+    coverage = core_keyword_coverage(
+        job, frozenset(), semantic_credit_fn=lambda unmatched, cv_skills: 999.0
+    )
+    assert coverage == 1.0
+
+
+def test_core_keyword_coverage_no_semantic_credit_fn_keeps_lexical_behavior():
+    # Sans fonction fournie (comportement par defaut, appelants existants
+    # inchanges) : identique a avant ce portage.
+    job = make_job(keyword_terms_raw=["SAS", "SAS", "SAS", "Excel"], title="Data Analyst")
+    coverage = core_keyword_coverage(job, frozenset({"Excel"}))
+    assert coverage == 0.0
+
+
 def test_core_keyword_coverage_title_alternation_disables_title_check():
     # "/" in the title signals alternative labels, not one headline tool --
     # the title-based core-keyword check must not fire here.

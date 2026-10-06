@@ -36,9 +36,14 @@ Composantes AI Real-Time désormais toutes portées :
 - Crédit sémantique partiel sur les compétences/mots-clés non matchés
   littéralement : le calcul d'embedding lui-même vit dans main.py (accès
   au modèle), injecté ici via `semantic_skill_credit_fn` dans
-  skills_component/priority_keyword_component -- même contrat que
-  _semantic_skill_credit côté AI Real-Time, réutilisé pour les deux
-  composantes comme chez eux.
+  skills_component/priority_keyword_component/core_keyword_coverage --
+  même contrat que _semantic_skill_credit côté AI Real-Time, réutilisé
+  pour les trois composantes comme chez eux (2026-10-06 pour la 3e :
+  AI Real-Time a tenté puis annulé d'élargir core_keyword_coverage à un
+  scan indépendant du titre de l'offre -- annulé car trop de faux
+  positifs, donc jamais porté ici -- mais a gardé cette extension plus
+  ciblée du crédit sémantique sur le mécanisme existant, portée telle
+  quelle).
 """
 from __future__ import annotations
 
@@ -568,14 +573,25 @@ _CORE_PENALTY_FLOOR = 0.45
 _TITLE_ALTERNATION_RE = re.compile(r"/|\bou\b", re.IGNORECASE)
 
 
-def core_keyword_coverage(job: PreparedJob, cv_skills: FrozenSet[str]) -> float:
+def core_keyword_coverage(
+    job: PreparedJob,
+    cv_skills: FrozenSet[str],
+    semantic_credit_fn: Optional[SemanticCreditFn] = None,
+) -> float:
     """Couverture (0.0-1.0) des mots-clés "appuyés" de l'offre. Portage à
     l'identique de _core_keyword_coverage : 1.0 (aucune pénalité) quand
     aucun mot-clé n'est appuyé. Compte les répétitions sur les compétences
     RÉSOLUES (voir expand_priority_keyword_term), pas sur les lignes
     brutes : une même compétence citée dans plusieurs lignes distinctes du
     champ recruteur doit compter comme répétée, même si aucune des lignes
-    n'est identique mot pour mot."""
+    n'est identique mot pour mot.
+
+    `semantic_credit_fn` (2026-10-06, portage AI Real-Time) : même filet de
+    sécurité que skills_component/priority_keyword_component -- un mot-clé
+    coeur non matché littéralement peut recevoir un crédit partiel par
+    similarité d'embedding plutôt que de compter comme totalement absent.
+    Rend ce mécanisme plus tolérant sans élargir sa portée (toujours gaté
+    derrière job.keyword_terms_raw non vide, inchangé)."""
     if not job.keyword_terms_raw:
         return 1.0
 
@@ -602,7 +618,11 @@ def core_keyword_coverage(job: PreparedJob, cv_skills: FrozenSet[str]) -> float:
     if not core:
         return 1.0
     matched = {c for c in core if c in cv_skills}
-    return len(matched) / len(core)
+    unmatched = core - matched
+    credit = 0.0
+    if unmatched and semantic_credit_fn is not None:
+        credit = semantic_credit_fn(frozenset(unmatched), frozenset(cv_skills))
+    return min(1.0, (len(matched) + credit) / len(core))
 
 
 # ── Composantes structurées ───────────────────────────────────────────────
@@ -811,7 +831,7 @@ def compute_final_score(
     # proportionnellement un score déjà différencié plutôt que d'écraser
     # tout le monde sur le même plancher. Même ordre que
     # match_parsed_documents côté AI Real-Time.
-    core_coverage = core_keyword_coverage(job, effective_cv_skills)
+    core_coverage = core_keyword_coverage(job, effective_cv_skills, semantic_skill_credit_fn)
     if core_coverage < 1.0:
         final *= _CORE_PENALTY_FLOOR + (1 - _CORE_PENALTY_FLOOR) * core_coverage
 
