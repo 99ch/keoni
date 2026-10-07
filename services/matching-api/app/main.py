@@ -61,8 +61,6 @@ app = FastAPI(title="Keoni Matching API", version="0.2.0")
 @dataclass(slots=True)
 class Settings:
     sentence_model: str = os.getenv("SENTENCE_MODEL", "intfloat/multilingual-e5-base")
-    top_k: int = int(os.getenv("MATCHING_TOP_K", "200"))
-    min_similarity: float = float(os.getenv("MATCHING_MIN_SIMILARITY", "0.2"))
     # Poids de la moyenne pondérée renormalisée — même logique que _DEFAULT_W
     # chez AI Real-Time (matcher.py), voir app/scoring.py::DEFAULT_WEIGHTS
     # pour le détail de chaque composante et le mapping vs leurs 6 signaux
@@ -135,12 +133,6 @@ class Settings:
     # CV déjà à jour sont sautés vite), donc le redéclencher à chaque
     # démarrage est sûr -- désactivable si jamais ça devient gênant.
     reindex_resume_on_startup: bool = os.getenv("MATCHING_REINDEX_RESUME_ON_STARTUP", "1") == "1"
-    retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
-    retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
-    # `lists = 100` sur l'index ivfflat (voir app/models.py) -- fixer les
-    # probes au même nombre force ivfflat à sonder tous les clusters, ce qui
-    # rend la recherche exacte plutôt qu'approximative. Voir /retrieve.
-    ivfflat_lists: int = int(os.getenv("MATCHING_IVFFLAT_LISTS", "100"))
     # Scoring autonome (voir run_autonomous_scoring_cycle) : remplace le
     # bouton "Lancer IA" côté WordPress par une boucle de fond qui rescore
     # une offre dès que son contenu change OU que le vivier de CV avance
@@ -449,14 +441,11 @@ class AutonomousScoringStatus(BaseModel):
 
 class RetrieveRequest(BaseModel):
     job: JobPayload
-    limit: int = Field(default_factory=lambda: settings.retrieve_semantic_top_k, ge=1, le=1000)
-    # Plafond du canal taxonomie (chevauchement de compétences canoniques),
-    # jusqu'ici figé côté serveur (retrieve_taxonomy_top_k, def. 300) sans
-    # moyen de l'aligner sur `limit` -- un appelant qui resserre `limit` à
-    # 40 pour ne garder que les meilleurs profils voyait quand même jusqu'à
-    # 300 CV supplémentaires entrer par ce second canal. Même défaut que
-    # `limit` pour ne rien changer aux appelants existants qui ne le passent pas.
-    taxonomy_limit: int = Field(default_factory=lambda: settings.retrieve_taxonomy_top_k, ge=1, le=1000)
+    # `limit`/`taxonomy_limit` existaient pour plafonner les deux anciens
+    # canaux de présélection -- retirés 2026-10-07 (pilier Sélection, plus
+    # aucun canal à plafonner, voir retrieve()). Un appelant qui les enverrait
+    # encore (l'ancien robot n8n, par exemple) ne casse rien : Pydantic
+    # ignore silencieusement les champs inconnus par défaut sur ce modèle.
 
 
 class SkillEmbeddingTuningRead(BaseModel):
@@ -2331,30 +2320,28 @@ def get_autonomous_scoring_status(_: None = Depends(require_api_key)) -> Autonom
 
 @app.post("/retrieve")
 def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> dict:
-    """Récupération hybride sur l'ensemble du vivier de CV indexé, en amont
-    du scoring -- remplace le filtrage par titre/mots-clés (LIKE SQL côté
-    WordPress) qui ne peut structurellement pas couvrir tout le vivier.
+    """Tous les CV éligibles pour une offre, en amont du scoring -- "éligible"
+    veut dire "a un document réel extrait avec succès" (cv_embeddings n'en
+    contient pas d'autre, voir reindex_cv_batch), rien de plus. Remplace le
+    filtrage par titre/mots-clés (LIKE SQL côté WordPress) qui ne peut
+    structurellement pas couvrir tout le vivier.
 
-    Trois canaux complémentaires, unis (pas l'un OU l'autre) :
-    - sémantique : similarité cosinus exacte (ivfflat.probes = lists, donc
-      sonde tous les clusters -- pas d'approximation) sur TOUTE la table
-      cv_embeddings, sans restriction de cv_id ;
-    - taxonomie : chevauchement de compétences canoniques ROME, pour ne pas
-      perdre un candidat à la compétence exacte que l'embedding sous-classerait ;
-    - titre : intitulé de candidature correspondant au titre de l'offre
-      (voir fetch_wp_resume_ids_by_title) -- rattrape un candidat que le
-      sémantique/la taxonomie peuvent rater (CV pauvre en texte, compétence
-      absente du référentiel), sans le plafond bas de l'ancien filtrage
-      WordPress en cascade (L1/L2/L3) qu'il remplace en partie.
+    2026-10-07 (pilier Sélection) : plus aucune présélection par ressemblance
+    (sémantique/taxonomie, chacune plafonnée à 300 jusqu'ici) -- exigence
+    explicite "tout CV avec un document réel est évalué, sans exception". Le
+    tri par score réel a toujours lieu plus loin (/score, rank_with_pgvector),
+    sur l'ensemble complet renvoyé ici, pas sur un sous-ensemble choisi par
+    avance. Conséquence directe : plus besoin de calculer un embedding
+    d'offre ni de chercher la compétence commune ici, cette étape ne faisait
+    que decider qui ENTRE -- la décision est maintenant "tout le monde".
 
-    Aucun des trois canaux n'est tronqué arbitrairement en cours de route :
-    chacun remonte son ensemble borné par un vrai critère (similarité,
-    recouvrement, ou -- pour le titre -- la portée déjà étroite d'un filtre
-    propre à une offre précise) ; le tri final par score réel a lieu plus
-    loin, dans /score.
+    titre : intitulé de candidature correspondant au titre de l'offre (voir
+    fetch_wp_resume_ids_by_title) -- gardé uniquement pour l'étiquette
+    d'affichage "titre strict" vs "candidats similaires" côté keoni-bridge
+    (channel_by_id ci-dessous), plus pour exclure qui que ce soit : tout le
+    monde est déjà inclus par la requête d'éligibilité.
 
-    Renvoie les fiches candidat complètes (via keoni-bridge), prêtes pour la
-    suite du pipeline n8n existante (Normalize Job + CV Fast).
+    Renvoie les fiches candidat complètes (via keoni-bridge).
     """
     if not _pgvector_ready:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
@@ -2368,32 +2355,13 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     if not prepared_job.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
 
-    # Un embedding par fenêtre de texte d'offre, pas un seul pour toute
-    # l'offre -- voir le commentaire sur JobEmbeddingChunk (models.py).
-    job_chunk_vectors = encode_texts(
-        [embedding_text(c, "query") for c in chunk_text(prepared_job.text, max_chunks=JOB_CHUNK_LIMIT)]
-    )
-    required_skills = sorted(prepared_job.skills_canonical)
     title_ids = fetch_wp_resume_ids_by_title(job.title or "")
 
     with engine.begin() as conn:
-        conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
+        eligible_rows = conn.execute(select(CvEmbedding.cv_id)).all()
+        eligible_ids = [row.cv_id for row in eligible_rows]
 
-        # Classement sur la meilleure paire (fenêtre d'offre, fenêtre de
-        # CV) -- jamais une moyenne, voir find_cv_ids_by_job_chunks().
-        semantic_rows = find_cv_ids_by_job_chunks(conn, job_chunk_vectors, payload.limit)
-        semantic_ids = [row.cv_id for row in semantic_rows]
-
-        taxonomy_ids: List[int] = []
-        if required_skills:
-            taxonomy_rows = conn.execute(
-                select(CvEmbedding.cv_id)
-                .where(CvEmbedding.skills_canonical.overlap(required_skills))
-                .limit(payload.taxonomy_limit)
-            ).all()
-            taxonomy_ids = [row.cv_id for row in taxonomy_rows]
-
-        combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids + title_ids))
+        combined_ids = list(dict.fromkeys(eligible_ids + title_ids))
 
         # Texte déjà extrait au moment du réindex -- injecté dans
         # cached_extracted_text (jamais text_content, voir assemble_cv_text)
@@ -2402,11 +2370,12 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
         # réindexé retombe simplement sur l'extraction à la volée.
         cached_text_by_id = fetch_cached_cv_text(conn, combined_ids)
 
-    # "title" prioritaire sur "similar" quand un CV est retenu par les deux
-    # canaux -- correspondance de titre strict (ex-L1 n8n) est le signal le
-    # plus explicite, affiché comme tel côté keoni-bridge (deux sections
-    # séparées : "titre strict" vs "candidats similaires").
-    channel_by_id: Dict[int, str] = {cv_id: "similar" for cv_id in semantic_ids + taxonomy_ids}
+    # "title" prioritaire sur "similar" -- correspondance de titre stricte
+    # (ex-L1 n8n) est le signal le plus explicite, affiché comme tel côté
+    # keoni-bridge (deux sections séparées : "titre strict" vs "candidats
+    # similaires"). Étiquette d'affichage uniquement, n'affecte plus qui est
+    # inclus (tout le monde l'est déjà via eligible_ids).
+    channel_by_id: Dict[int, str] = {cv_id: "similar" for cv_id in eligible_ids}
     channel_by_id.update({cv_id: "title" for cv_id in title_ids})
 
     cvs = fetch_wp_resumes_by_ids(combined_ids)
@@ -2424,8 +2393,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     return {
         "job_id": job.id,
         "count": len(cvs),
-        "semantic_count": len(semantic_ids),
-        "taxonomy_count": len(taxonomy_ids),
+        "eligible_count": len(eligible_ids),
         "title_count": len(title_ids),
         "job": job.model_dump(),
         "cvs": cvs,
@@ -2470,17 +2438,14 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # reste du vivier (sémantique/taxonomie) remplissait à lui seul les
     # top_k places.
     #
-    # Un premier correctif élargissait juste la limite de top_k à
-    # top_k + title_count, en supposant que le reste du vivier tenait déjà
-    # dans top_k -- hypothèse fausse en pratique (retrieve() peut fournir
-    # bien plus de candidats "similar" que top_k à lui seul, constaté en
-    # prod : les 20 candidats "titre" avaient beau exister dans `candidates`
-    # en entrée, aucun ne survivait au classement). Les deux canaux sont
-    # donc classés séparément puis fusionnés : le canal "titre" sans aucune
-    # coupe (nativement étroit), le canal "similar" avec la coupe top_k
-    # habituelle -- toujours triés par la même similarité, aucun passe-droit
-    # sur le score lui-même, juste la garantie que "titre" ne rentre jamais
-    # en concurrence avec "similar" pour une place dans le classement brut.
+    # 2026-10-07 (pilier Sélection) : les deux canaux sont toujours classés
+    # séparément puis fusionnés (le canal "titre" garde sa propre étiquette
+    # d'affichage, voir retrieve()), mais ni l'un ni l'autre n'est plus
+    # coupé à un plafond -- "len(...)" demande le classement de la totalité
+    # de chaque groupe, personne n'est exclu avant le calcul du score.
+    # Avant ce changement, le canal "similar" était coupé à settings.top_k
+    # (200) ici même ; supprimé avec le reste du mécanisme de plafond
+    # (voir aussi retrieve(), qui ne présélectionne plus personne en amont).
     title_candidates = [
         cv for cv in candidates if getattr(cv.payload, "retrieval_channel", None) == "title"
     ]
@@ -2496,25 +2461,32 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
         if ranked_title is None:
             ranked_title = rank_with_faiss(job, title_candidates, len(title_candidates))
 
-    ranked_other = rank_with_pgvector(job, payload.job.id, other_candidates, settings.top_k) if _pgvector_ready else None
+    ranked_other = rank_with_pgvector(
+        job, payload.job.id, other_candidates, len(other_candidates)
+    ) if _pgvector_ready else None
     if ranked_other is None:
-        ranked_other = rank_with_faiss(job, other_candidates, settings.top_k)
+        ranked_other = rank_with_faiss(job, other_candidates, len(other_candidates))
 
     ranked = ranked_title + ranked_other
 
     # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
-    # ranked reste trié par similarité d'embedding, pas par ce score.
+    # ranked reste trié par similarité d'embedding, pas par ce score. Ce
+    # plafond-ci (crossencoder_top_k) n'exclut personne du résultat final --
+    # il borne seulement qui reçoit la relecture fine ; un candidat hors de
+    # ce top-k garde quand même un score réel (similarité brute en repli,
+    # voir rerank_scores.get() -> None ci-dessous et compute_final_score).
     rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
 
-    scored_items: List[ScoreItem] = []
-    for rank, (cv, sim) in enumerate(ranked):
-        if sim < settings.min_similarity:
-            continue
-        scored_items.append(build_score(job, cv, sim, rank, rerank_scores.get(cv.payload.id)))
-
-    if not scored_items and ranked:
-        cv, sim = ranked[0]
-        scored_items.append(build_score(job, cv, sim, 0, rerank_scores.get(cv.payload.id)))
+    # 2026-10-07 (pilier Sélection) : plus de seuil de similarité minimale
+    # ici -- chaque candidat classé reçoit un score réel, quelle que soit sa
+    # similarité d'embedding brute (un score final bas à cause d'un signal
+    # faible n'est pas la même chose qu'une exclusion silencieuse avant même
+    # le calcul). "Tout CV avec un document réel est évalué, sans
+    # exception."
+    scored_items: List[ScoreItem] = [
+        build_score(job, cv, sim, rank, rerank_scores.get(cv.payload.id))
+        for rank, (cv, sim) in enumerate(ranked)
+    ]
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en
