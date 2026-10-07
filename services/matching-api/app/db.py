@@ -93,6 +93,30 @@ def init_db() -> bool:
                     "ADD COLUMN IF NOT EXISTS text_content TEXT NOT NULL DEFAULT ''"
                 )
             )
+            # Faits lus dans le vrai texte du CV (document_profile.py,
+            # portage AI Real-Time, 2026-10-06) -- remplacent les champs de
+            # formulaire WordPress utilisés jusqu'ici pour ces informations.
+            conn.execute(
+                text(
+                    "ALTER TABLE cv_embeddings "
+                    "ADD COLUMN IF NOT EXISTS experience_years INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+            conn.execute(
+                text("ALTER TABLE cv_embeddings ADD COLUMN IF NOT EXISTS contract_type TEXT")
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE cv_embeddings "
+                    "ADD COLUMN IF NOT EXISTS education_text TEXT NOT NULL DEFAULT ''"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE cv_embeddings "
+                    "ADD COLUMN IF NOT EXISTS language_terms TEXT[] NOT NULL DEFAULT '{}'"
+                )
+            )
             # L'embedding par CV entier vit désormais dans cv_embedding_chunks
             # (table neuve, créée ci-dessus par create_all()) -- cette colonne
             # devient inutile et, étant NOT NULL sans défaut, bloquerait tout

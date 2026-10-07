@@ -13,23 +13,21 @@ from app.scoring import (  # noqa: E402
     SKILL_CAP_FLOOR,
     PreparedCv,
     PreparedJob,
-    category_component,
     chunk_text,
     compute_final_score,
+    contract_component,
     core_keyword_coverage,
+    education_component,
     enrich_cv_skills,
     experience_component,
     experience_zone_score,
     get_skill_embedding_tuning,
     infer_seniority_years,
-    jobtype_component,
-    location_component,
+    language_component,
     normalize_priority_keyword,
     normalize_whitespace,
     priority_keyword_component,
-    qualification_component,
     resolve_priority_keywords,
-    salary_component,
     set_skill_embedding_tuning,
     skills_component,
     split_priority_keyword_terms,
@@ -46,15 +44,13 @@ def make_job(**overrides) -> PreparedJob:
         keywords=[],
         keyword_set=set(),
         skills_canonical=set(),
-        location="",
-        category="",
-        jobtype="",
         min_experience_years=None,
-        salary_min=None,
-        salary_max=None,
         title="",
         keyword_terms_raw=[],
         scoring_profile=None,
+        education_text="",
+        language_terms=[],
+        contract_type=None,
     )
     defaults.update(overrides)
     return PreparedJob(**defaults)
@@ -69,13 +65,10 @@ def make_cv(**overrides) -> PreparedCv:
         keywords=[],
         keyword_set=set(),
         skills_canonical=set(),
-        location="",
-        category="",
-        jobtype="",
         experience_years=None,
-        salary_expected_min=None,
-        salary_expected_max=None,
-        qualified=None,
+        education_text="",
+        language_terms=[],
+        contract_type=None,
     )
     defaults.update(overrides)
     return PreparedCv(**defaults)
@@ -355,36 +348,83 @@ def test_experience_zone_shortfall_is_linear():
     assert experience_zone_score(5, 10) == 0.5
 
 
-# ── jobtype / category / location / salary / qualification ──────────────
+# ── education / languages / contract ─────────────────────────────────────
+# Portage de rhconsole (AI Real-Time, matcher.py::_education_score/
+# _language_score/_contract_score) -- remplacent jobtype/category/location/
+# salary/qualification (2026-10-06, pilier Scoring), qui comparaient des
+# cases de formulaire WordPress sans aucun équivalent chez rhconsole.
 
 
-def test_jobtype_component_match():
-    job = make_job(jobtype="cdi")
-    cv = make_cv(jobtype="cdi")
-    assert jobtype_component(job, cv) == (1.0, True)
+def test_education_component_no_signal_when_a_side_is_empty():
+    job = make_job(education_text="")
+    cv = make_cv(education_text="Master Informatique")
+    assert education_component(job, cv) == (0.5, False)
 
 
-def test_category_component_match():
-    job = make_job(category="developpement web")
-    cv = make_cv(category="developpement web")
-    assert category_component(job, cv) == (1.0, True)
+def test_education_component_exact_overlap_scores_one():
+    job = make_job(education_text="Master Informatique")
+    cv = make_cv(education_text="Master Informatique")
+    assert education_component(job, cv) == (1.0, True)
 
 
-def test_location_component_substring_match():
-    job = make_job(location="paris")
-    cv = make_cv(location="paris 15e")
-    assert location_component(job, cv) == (1.0, True)
+def test_education_component_partial_jaccard_overlap():
+    job = make_job(education_text="Master Informatique Reseaux")
+    cv = make_cv(education_text="Master Informatique Finance")
+    value, ok = education_component(job, cv)
+    assert ok is True
+    # tokens >=3 car. : {master, informatique, reseaux} vs {master, informatique, finance}
+    # intersection=2, union=4 -> 0.5
+    assert value == pytest.approx(0.5)
 
 
-def test_salary_component_within_budget():
-    job = make_job(salary_max=50000)
-    cv = make_cv(salary_expected_min=45000)
-    assert salary_component(job, cv) == (1.0, True)
+def test_language_component_no_signal_when_job_requires_nothing():
+    job = make_job(language_terms=[])
+    cv = make_cv(language_terms=["anglais"])
+    assert language_component(job, cv) == (0.5, False)
 
 
-def test_qualification_component_none_is_no_signal():
-    cv = make_cv(qualified=None)
-    assert qualification_component(cv) == (0.5, False)
+def test_language_component_cv_languages_not_extracted():
+    job = make_job(language_terms=["anglais"])
+    cv = make_cv(language_terms=[])
+    assert language_component(job, cv) == (0.3, False)
+
+
+def test_language_component_partial_coverage():
+    job = make_job(language_terms=["anglais", "espagnol"])
+    cv = make_cv(language_terms=["anglais"])
+    value, ok = language_component(job, cv)
+    assert ok is True
+    assert value == pytest.approx(0.5)
+
+
+def test_language_component_full_coverage():
+    job = make_job(language_terms=["anglais"])
+    cv = make_cv(language_terms=["anglais", "espagnol"])
+    assert language_component(job, cv) == (1.0, True)
+
+
+def test_contract_component_no_signal_when_job_has_no_contract_type():
+    job = make_job(contract_type=None)
+    cv = make_cv(contract_type="CDI")
+    assert contract_component(job, cv) == (0.5, False)
+
+
+def test_contract_component_cv_contract_type_not_extracted():
+    job = make_job(contract_type="CDI")
+    cv = make_cv(contract_type=None)
+    assert contract_component(job, cv) == (0.4, False)
+
+
+def test_contract_component_exact_match():
+    job = make_job(contract_type="Freelance")
+    cv = make_cv(contract_type="Freelance")
+    assert contract_component(job, cv) == (1.0, True)
+
+
+def test_contract_component_mismatch():
+    job = make_job(contract_type="CDI")
+    cv = make_cv(contract_type="Freelance")
+    assert contract_component(job, cv) == (0.0, True)
 
 
 # ── scoring profiles ──────────────────────────────────────────────────────
@@ -431,11 +471,9 @@ def test_final_score_renormalizes_over_missing_components():
     assert set(result.low_confidence_components) == {
         "keywords",
         "experience",
-        "jobtype",
-        "category",
-        "location",
-        "salary",
-        "qualification",
+        "education",
+        "languages",
+        "contract",
     }
 
 

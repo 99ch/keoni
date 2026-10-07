@@ -51,12 +51,7 @@ def _job(text: str, title: str = "", keywords_raw: str | None = None, min_experi
         keywords=[],
         keyword_set=set(),
         skills_canonical=set(find_skills(text)),
-        location="",
-        category="",
-        jobtype="",
         min_experience_years=min_experience_years,
-        salary_min=None,
-        salary_max=None,
         title=title,
         keyword_terms_raw=split_priority_keyword_terms(keywords_raw),
         scoring_profile=None,
@@ -72,13 +67,7 @@ def _cv(text: str, experience_years=None) -> PreparedCv:
         keywords=[],
         keyword_set=set(),
         skills_canonical=set(find_skills(text)),
-        location="",
-        category="",
-        jobtype="",
         experience_years=experience_years,
-        salary_expected_min=None,
-        salary_expected_max=None,
-        qualified=None,
     )
 
 

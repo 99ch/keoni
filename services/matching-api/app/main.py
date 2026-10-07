@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app import extraction
 from app.db import get_engine, init_db
+from app.document_profile import build_document_profile
 from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk, JobScoringState
 from app.scoring import (
     CV_CHUNK_LIMIT,
@@ -44,7 +45,6 @@ from app.scoring import (
     compute_final_score,
     get_skill_embedding_tuning,
     normalize_whitespace,
-    overlap_text,
     strip_html,
     set_skill_embedding_tuning,
     split_priority_keyword_terms,
@@ -61,8 +61,6 @@ app = FastAPI(title="Keoni Matching API", version="0.2.0")
 @dataclass(slots=True)
 class Settings:
     sentence_model: str = os.getenv("SENTENCE_MODEL", "intfloat/multilingual-e5-base")
-    top_k: int = int(os.getenv("MATCHING_TOP_K", "200"))
-    min_similarity: float = float(os.getenv("MATCHING_MIN_SIMILARITY", "0.2"))
     # Poids de la moyenne pondérée renormalisée — même logique que _DEFAULT_W
     # chez AI Real-Time (matcher.py), voir app/scoring.py::DEFAULT_WEIGHTS
     # pour le détail de chaque composante et le mapping vs leurs 6 signaux
@@ -71,13 +69,12 @@ class Settings:
     w_skills: float = float(os.getenv("MATCHING_W_SKILLS", str(DEFAULT_WEIGHTS["skills"])))
     w_keywords: float = float(os.getenv("MATCHING_W_KEYWORDS", str(DEFAULT_WEIGHTS["keywords"])))
     w_experience: float = float(os.getenv("MATCHING_W_EXPERIENCE", str(DEFAULT_WEIGHTS["experience"])))
-    w_jobtype: float = float(os.getenv("MATCHING_W_JOBTYPE", str(DEFAULT_WEIGHTS["jobtype"])))
-    w_category: float = float(os.getenv("MATCHING_W_CATEGORY", str(DEFAULT_WEIGHTS["category"])))
-    w_location: float = float(os.getenv("MATCHING_W_LOCATION", str(DEFAULT_WEIGHTS["location"])))
-    w_salary: float = float(os.getenv("MATCHING_W_SALARY", str(DEFAULT_WEIGHTS["salary"])))
-    w_qualification: float = float(os.getenv("MATCHING_W_QUALIFICATION", str(DEFAULT_WEIGHTS["qualification"])))
-    hard_filter_jobtype: bool = os.getenv("MATCHING_HARD_FILTER_JOBTYPE", "1") == "1"
-    hard_filter_qualification: bool = os.getenv("MATCHING_HARD_FILTER_QUALIFICATION", "1") == "1"
+    # education/languages/contract (2026-10-06, pilier Scoring) : remplacent
+    # jobtype/category/location/salary/qualification, qui comparaient des
+    # cases de formulaire WordPress sans aucun équivalent chez rhconsole.
+    w_education: float = float(os.getenv("MATCHING_W_EDUCATION", str(DEFAULT_WEIGHTS["education"])))
+    w_languages: float = float(os.getenv("MATCHING_W_LANGUAGES", str(DEFAULT_WEIGHTS["languages"])))
+    w_contract: float = float(os.getenv("MATCHING_W_CONTRACT", str(DEFAULT_WEIGHTS["contract"])))
     # 64 plutôt que 32 : moins d'appels/overhead Python par lot sur CPU pour
     # le réindex complet (lots de reindex_page_size=100 textes) ; sans effet
     # sur /score en usage normal (nombre de CV par offre très inférieur à
@@ -92,7 +89,6 @@ class Settings:
     crossencoder_model: str = os.getenv(
         "MATCHING_CROSSENCODER_MODEL", "antoinelouis/crossencoder-camembert-large-mmarcoFR"
     )
-    crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "30"))
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -136,12 +132,6 @@ class Settings:
     # CV déjà à jour sont sautés vite), donc le redéclencher à chaque
     # démarrage est sûr -- désactivable si jamais ça devient gênant.
     reindex_resume_on_startup: bool = os.getenv("MATCHING_REINDEX_RESUME_ON_STARTUP", "1") == "1"
-    retrieve_semantic_top_k: int = int(os.getenv("MATCHING_RETRIEVE_SEMANTIC_TOP_K", "300"))
-    retrieve_taxonomy_top_k: int = int(os.getenv("MATCHING_RETRIEVE_TAXONOMY_TOP_K", "300"))
-    # `lists = 100` sur l'index ivfflat (voir app/models.py) -- fixer les
-    # probes au même nombre force ivfflat à sonder tous les clusters, ce qui
-    # rend la recherche exacte plutôt qu'approximative. Voir /retrieve.
-    ivfflat_lists: int = int(os.getenv("MATCHING_IVFFLAT_LISTS", "100"))
     # Scoring autonome (voir run_autonomous_scoring_cycle) : remplace le
     # bouton "Lancer IA" côté WordPress par une boucle de fond qui rescore
     # une offre dès que son contenu change OU que le vivier de CV avance
@@ -363,6 +353,17 @@ class CvPayload(BaseModel):
     # /score-fast pour éviter de re-télécharger/re-extraire (OCR/Tika) le
     # fichier à chaque appel. Jamais rempli depuis le payload WordPress brut.
     cached_extracted_text: Optional[str] = None
+    # Faits lus dans le vrai texte du CV lors d'un réindex précédent
+    # (CvEmbedding.experience_years/contract_type/education_text/
+    # language_terms -- document_profile.py, pilier Extraction), injectés
+    # par /retrieve pour éviter de relire tout le texte à chaque appel --
+    # même principe que cached_extracted_text ci-dessus. None pour un CV pas
+    # encore réindexé : prepare_cv() calcule alors à la volée (voir son
+    # commentaire), jamais de repli sur un champ de formulaire WordPress.
+    cached_experience_years: Optional[int] = None
+    cached_contract_type: Optional[str] = None
+    cached_education_text: Optional[str] = None
+    cached_language_terms: Optional[List[str]] = None
     # "title" (correspondance stricte de titre, ex-L1 n8n) ou "similar"
     # (retenu par le canal sémantique/taxonomie uniquement) -- injecté par
     # retrieve() (voir son commentaire), jamais fourni par un appelant.
@@ -439,14 +440,11 @@ class AutonomousScoringStatus(BaseModel):
 
 class RetrieveRequest(BaseModel):
     job: JobPayload
-    limit: int = Field(default_factory=lambda: settings.retrieve_semantic_top_k, ge=1, le=1000)
-    # Plafond du canal taxonomie (chevauchement de compétences canoniques),
-    # jusqu'ici figé côté serveur (retrieve_taxonomy_top_k, def. 300) sans
-    # moyen de l'aligner sur `limit` -- un appelant qui resserre `limit` à
-    # 40 pour ne garder que les meilleurs profils voyait quand même jusqu'à
-    # 300 CV supplémentaires entrer par ce second canal. Même défaut que
-    # `limit` pour ne rien changer aux appelants existants qui ne le passent pas.
-    taxonomy_limit: int = Field(default_factory=lambda: settings.retrieve_taxonomy_top_k, ge=1, le=1000)
+    # `limit`/`taxonomy_limit` existaient pour plafonner les deux anciens
+    # canaux de présélection -- retirés 2026-10-07 (pilier Sélection, plus
+    # aucun canal à plafonner, voir retrieve()). Un appelant qui les enverrait
+    # encore (l'ancien robot n8n, par exemple) ne casse rien : Pydantic
+    # ignore silencieusement les champs inconnus par défaut sur ce modèle.
 
 
 class SkillEmbeddingTuningRead(BaseModel):
@@ -518,35 +516,6 @@ def parse_float(value: Optional[object]) -> Optional[float]:
         return float(match.group(0))
     except ValueError:
         return None
-
-
-def parse_range(value: Optional[object]) -> Tuple[Optional[float], Optional[float]]:
-    if value is None:
-        return None, None
-    text = str(value).strip().replace(",", ".")
-    if not text:
-        return None, None
-    numbers = [float(m) for m in re.findall(r"\d+(?:\.\d+)?", text)]
-    if not numbers:
-        return None, None
-    if len(numbers) == 1:
-        return numbers[0], numbers[0]
-    return min(numbers), max(numbers)
-
-
-def parse_boolish(value: Optional[object]) -> Optional[bool]:
-    if value is None:
-        return None
-    text = normalized_text(value)
-    if not text:
-        return None
-    yes_values = {"yes", "oui", "true", "1", "qualifie", "qualifié", "ok"}
-    no_values = {"no", "non", "false", "0", "ko"}
-    if text in yes_values:
-        return True
-    if text in no_values:
-        return False
-    return None
 
 
 def find_first(source: dict, keys: Sequence[str]) -> Optional[object]:
@@ -660,19 +629,38 @@ def assemble_cv_text(cv: CvPayload) -> str:
     return ""
 
 
-def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, str]:
-    """Texte déjà extrait du vrai fichier CV lors d'un réindex précédent
-    (CvEmbedding.text_content) -- à injecter dans CvPayload.cached_extracted_text
-    (jamais dans text_content/resume/skills, voir assemble_cv_text()) pour
-    que /retrieve et /score-fast évitent de re-télécharger/re-extraire le
-    fichier à chaque appel. Un cv_id absent du résultat (jamais réindexé)
-    retombe simplement sur l'extraction à la volée côté assemble_cv_text()."""
+def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, dict]:
+    """Texte + faits déjà extraits du vrai fichier CV lors d'un réindex
+    précédent (CvEmbedding.text_content/experience_years/contract_type/
+    education_text/language_terms) -- à injecter dans les champs cached_*
+    de CvPayload pour que /retrieve et /score-fast évitent de re-télécharger/
+    re-extraire (OCR/Tika) et de relire (document_profile.py) le fichier à
+    chaque appel. Un cv_id absent du résultat (jamais réindexé) retombe
+    simplement sur l'extraction à la volée côté assemble_cv_text()/
+    prepare_cv()."""
     if not cv_ids:
         return {}
     rows = conn.execute(
-        select(CvEmbedding.cv_id, CvEmbedding.text_content).where(CvEmbedding.cv_id.in_(cv_ids))
+        select(
+            CvEmbedding.cv_id,
+            CvEmbedding.text_content,
+            CvEmbedding.experience_years,
+            CvEmbedding.contract_type,
+            CvEmbedding.education_text,
+            CvEmbedding.language_terms,
+        ).where(CvEmbedding.cv_id.in_(cv_ids))
     ).all()
-    return {row.cv_id: row.text_content for row in rows if row.text_content}
+    return {
+        row.cv_id: {
+            "text_content": row.text_content,
+            "experience_years": row.experience_years,
+            "contract_type": row.contract_type,
+            "education_text": row.education_text,
+            "language_terms": row.language_terms,
+        }
+        for row in rows
+        if row.text_content
+    }
 
 
 def prepare_job(job: JobPayload) -> PreparedJob:
@@ -694,14 +682,16 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     # la présence de mots. Repli sur `text` si les champs naturels sont vides.
     semantic_parts = [job.title, description, content, excerpt]
     semantic_text = normalize_whitespace(" ".join(filter(None, semantic_parts))) or text
-    location = (job.location or meta.get("location") or "").lower()
     tokens = tokenize(f"{job.title} {description}")
-    category = normalized_text(find_first(meta, ["jobcategory_text", "category_text", "job_category", "category"]))
-    jobtype = normalized_text(find_first(meta, ["jobtype_text", "job_type", "type", "jobtype"]))
     min_experience_years = parse_float(find_first(meta, ["experience", "min_experience", "required_experience"]))
 
-    salary_min = parse_float(find_first(meta, ["salaryfrom", "salary_min", "salary_from"]))
-    salary_max = parse_float(find_first(meta, ["salaryto", "salary_max", "salary_to", "tjm", "salary"]))
+    # Formation/langues/contrat lus dans le vrai texte de l'offre (document_
+    # profile.py, portage AI Real-Time) -- remplacent category/location/
+    # jobtype/salary, qui comparaient des cases de formulaire WordPress sans
+    # équivalent chez rhconsole (2026-10-06, pilier Scoring). Calculé à la
+    # volée comme le reste de prepare_job (pas de stockage persistant côté
+    # offre, cohérent avec l'existant).
+    document_profile = build_document_profile(text)
 
     # job.keywords brut (avant dédup) alimente PUREMENT le mécanisme
     # "mots-clés prioritaires" (couverture + pénalité core-keyword) -- voir
@@ -721,21 +711,18 @@ def prepare_job(job: JobPayload) -> PreparedJob:
         keywords=keywords,
         keyword_set=set(keywords),
         skills_canonical=set(find_skills(text)),
-        location=location,
-        category=category,
-        jobtype=jobtype,
         min_experience_years=min_experience_years,
-        salary_min=salary_min,
-        salary_max=salary_max,
         title=job.title or "",
         keyword_terms_raw=keyword_terms_raw,
         scoring_profile=scoring_profile,
+        education_text=document_profile.education_text,
+        language_terms=document_profile.language_terms,
+        contract_type=document_profile.contract_type,
     )
 
 
 def prepare_cv(cv: CvPayload) -> PreparedCv:
     meta = cv.metadata or {}
-    raw = cv.model_dump()
     text = assemble_cv_text(cv)
     text_tokens = tokenize(text) if text else set()
     title_tokens = tokenize(" ".join(filter(None, [cv.application_title, cv.title])))
@@ -743,23 +730,26 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
     # utilisé pour le scoring (voir assemble_cv_text()).
     keywords = parse_keywords(cv.keywords) + parse_keywords(meta.get("keywords"))
     keywords = list(dict.fromkeys(keywords))
-    location = (cv.location or meta.get("location") or "").lower()
 
-    category = normalized_text(
-        find_first(raw, ["category_text", "category", "job_category"]) or find_first(meta, ["category_text", "category", "job_category"])
-    )
-    jobtype = normalized_text(
-        find_first(raw, ["job_type", "type", "jobtype", "jobtype_text"]) or find_first(meta, ["job_type", "type", "jobtype", "jobtype_text"])
-    )
-    experience_years = parse_float(
-        find_first(raw, ["total_experience", "experience", "experience_years"]) or find_first(meta, ["total_experience", "experience", "experience_years"])
-    )
-    salary_min, salary_max = parse_range(
-        find_first(raw, ["salary_requested", "salary", "salary_range", "expected_salary", "tjm"]) or find_first(meta, ["salary_requested", "salary", "salary_range", "expected_salary", "tjm"])
-    )
-    qualified = parse_boolish(
-        find_first(raw, ["qualified_for_job", "qualified", "qualifie", "qualifié"]) or find_first(meta, ["qualified_for_job", "qualified", "qualifie", "qualifié"])
-    )
+    # Expérience/formation/langues/contrat lus dans le vrai texte du CV
+    # (document_profile.py, portage AI Real-Time) -- remplacent category/
+    # location/jobtype/salary/qualification, qui comparaient des cases de
+    # formulaire WordPress sans équivalent chez rhconsole (2026-10-06,
+    # pilier Scoring). cached_* vient d'un réindex précédent (voir
+    # fetch_cached_cv_text/reindex_cv_batch) pour éviter de relire tout le
+    # texte à chaque appel ; repli sur un calcul à la volée pour un CV pas
+    # encore réindexé -- jamais de repli sur un champ de formulaire.
+    if cv.cached_experience_years is not None:
+        experience_years: Optional[float] = float(cv.cached_experience_years)
+        education_text = cv.cached_education_text or ""
+        language_terms = list(cv.cached_language_terms or [])
+        contract_type = cv.cached_contract_type
+    else:
+        document_profile = build_document_profile(text)
+        experience_years = float(document_profile.experience_years)
+        education_text = document_profile.education_text
+        language_terms = document_profile.language_terms
+        contract_type = document_profile.contract_type
 
     return PreparedCv(
         payload=cv,
@@ -769,30 +759,13 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
         keywords=keywords,
         keyword_set=set(keywords),
         skills_canonical=set(find_skills(text)),
-        location=location,
-        category=category,
-        jobtype=jobtype,
         experience_years=experience_years,
-        salary_expected_min=salary_min,
-        salary_expected_max=salary_max,
-        qualified=qualified,
+        education_text=education_text,
+        language_terms=language_terms,
+        contract_type=contract_type,
     )
 
 
-def passes_hard_filters(job: PreparedJob, cv: PreparedCv) -> Tuple[bool, List[str]]:
-    reasons: List[str] = []
-
-    if settings.hard_filter_qualification and cv.qualified is False:
-        reasons.append("Candidat non qualifié pour le poste")
-
-    if settings.hard_filter_jobtype and job.jobtype and cv.jobtype and not overlap_text(job.jobtype, cv.jobtype):
-        reasons.append("Type de contrat incompatible")
-
-    if job.min_experience_years is not None and cv.experience_years is not None:
-        if cv.experience_years + 0.5 < job.min_experience_years:
-            reasons.append("Expérience insuffisante")
-
-    return len(reasons) == 0, reasons
 
 
 def encode_texts(texts: Sequence[str]) -> np.ndarray:
@@ -896,6 +869,27 @@ def fetch_wp_job(job_id: int) -> Optional["JobPayload"]:
         location=data.get("location"),
         meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
     )
+
+
+def fetch_wp_job_updated_at(job_id: int) -> str:
+    """`updated_at` d'une offre (même endpoint que fetch_wp_job, voir
+    class-keoni-bridge-rest.php::get_job -- déjà exposé côté WP mais pas lu
+    par fetch_wp_job, dont la signature ne doit pas changer pour ses autres
+    appelants). Utilisé uniquement par /score/trigger pour que
+    upsert_job_scoring_state (appelé par score_job_autonomously) enregistre
+    une vraie valeur, pas un déclenchement manuel qui fausserait le suivi du
+    cycle autonome. Chaîne vide si indisponible -- score_job_autonomously
+    continue de fonctionner, juste avec un suivi moins précis pour cette
+    offre jusqu'au prochain cycle normal."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        return ""
+    try:
+        url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/job/{job_id}"
+        response = requests.get(url, headers={"X-API-Key": settings.wp_api_key}, timeout=30)
+        response.raise_for_status()
+        return str(response.json().get("updated_at") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def push_matching_results(job_id: int, response: "ScoreResponse") -> None:
@@ -1027,6 +1021,10 @@ def resume_to_cv_payload(resume: dict) -> "CvPayload":
         candidate_email=resume.get("email") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
         cached_extracted_text=resume.get("cached_extracted_text") or None,
+        cached_experience_years=resume.get("cached_experience_years"),
+        cached_contract_type=resume.get("cached_contract_type") or None,
+        cached_education_text=resume.get("cached_education_text") or None,
+        cached_language_terms=resume.get("cached_language_terms") or None,
         retrieval_channel=resume.get("retrieval_channel") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
@@ -1172,11 +1170,19 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
 
         for cv_id, text_value in to_embed:
             skills = sorted(find_skills(text_value))
+            # Faits lus dans le vrai texte (document_profile.py, portage
+            # AI Real-Time) -- remplacent les champs de formulaire WordPress
+            # utilisés jusqu'ici pour experience/contrat/langues côté CV.
+            profile = build_document_profile(text_value)
             stmt = pg_insert(CvEmbedding).values(
                 cv_id=cv_id,
                 content_hash=content_hash(text_value),
                 skills_canonical=skills,
                 text_content=text_value,
+                experience_years=profile.experience_years,
+                contract_type=profile.contract_type,
+                education_text=profile.education_text,
+                language_terms=profile.language_terms,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=[CvEmbedding.cv_id],
@@ -1184,6 +1190,10 @@ def reindex_cv_batch(resumes: List[dict]) -> None:
                     "content_hash": stmt.excluded.content_hash,
                     "skills_canonical": stmt.excluded.skills_canonical,
                     "text_content": stmt.excluded.text_content,
+                    "experience_years": stmt.excluded.experience_years,
+                    "contract_type": stmt.excluded.contract_type,
+                    "education_text": stmt.excluded.education_text,
+                    "language_terms": stmt.excluded.language_terms,
                     "updated_at": func.now(),
                 },
             )
@@ -1896,11 +1906,9 @@ def base_weights() -> dict[str, float]:
         "skills": settings.w_skills,
         "keywords": settings.w_keywords,
         "experience": settings.w_experience,
-        "jobtype": settings.w_jobtype,
-        "category": settings.w_category,
-        "location": settings.w_location,
-        "salary": settings.w_salary,
-        "qualification": settings.w_qualification,
+        "education": settings.w_education,
+        "languages": settings.w_languages,
+        "contract": settings.w_contract,
     }
 
 
@@ -2008,24 +2016,6 @@ def build_score(
     if title_overlap:
         strengths.append(f"Titre proche ({', '.join(sorted(title_overlap)[:3])})")
 
-    if "qualification" not in low:
-        if cv.qualified:
-            strengths.append("Profil déclaré qualifié pour le poste")
-        else:
-            weaknesses.append("Profil déclaré non qualifié")
-
-    if "jobtype" not in low:
-        if result.breakdown["jobtype"] == 1.0:
-            strengths.append("Type de contrat compatible")
-        else:
-            weaknesses.append("Type de contrat différent")
-
-    if "category" not in low:
-        if result.breakdown["category"] == 1.0:
-            strengths.append("Catégorie métier alignée")
-        else:
-            weaknesses.append("Catégorie métier différente")
-
     if "experience" not in low:
         # required_years peut venir d'une inférence de séniorité (titre de
         # l'offre) plutôt que d'une durée explicite -- job.min_experience_years
@@ -2037,17 +2027,23 @@ def build_score(
             required_label = f"{required_years:g}" if required_years is not None else "?"
             weaknesses.append(f"Expérience détectée : {cv.experience_years:g} ans pour {required_label} requis.")
 
-    if "salary" not in low:
-        if result.breakdown["salary"] == 1.0:
-            strengths.append("Prétention salariale compatible")
+    if "contract" not in low:
+        if result.breakdown["contract"] == 1.0:
+            strengths.append("Type de contrat compatible")
         else:
-            weaknesses.append("Prétention salariale au-dessus du budget")
+            weaknesses.append("Type de contrat différent")
 
-    if "location" not in low:
-        if result.breakdown["location"] == 1.0:
-            strengths.append("Localisation compatible")
+    if "education" not in low:
+        if result.breakdown["education"] and result.breakdown["education"] >= 0.5:
+            strengths.append("Formation alignée avec l'offre")
         else:
-            weaknesses.append("Localisation différente")
+            weaknesses.append("Formation peu alignée avec l'offre")
+
+    if "languages" not in low:
+        if result.breakdown["languages"] == 1.0:
+            strengths.append("Langues requises toutes couvertes")
+        else:
+            weaknesses.append("Certaines langues requises ne sont pas couvertes")
 
     # Phrase de synthèse (même esprit que le paragraphe d'introduction
     # d'AI Real-Time : quelles sections ont un vrai signal + mots-clés
@@ -2056,11 +2052,9 @@ def build_score(
         "skills": "compétences",
         "keywords": "mots-clés",
         "experience": "expérience",
-        "jobtype": "type de contrat",
-        "category": "catégorie",
-        "location": "localisation",
-        "salary": "salaire",
-        "qualification": "qualification",
+        "education": "formation",
+        "languages": "langues",
+        "contract": "type de contrat",
     }
     present_sections = [
         label for key, label in _component_labels_fr.items() if key not in low
@@ -2091,12 +2085,9 @@ def build_score(
         "excerpts_job": excerpts_job,
         "scoring_profile": job.scoring_profile,
         "rank": rank + 1,
-        "cv_category": cv.category,
-        "cv_jobtype": cv.jobtype,
         "cv_experience_years": cv.experience_years,
-        "cv_salary_min": cv.salary_expected_min,
-        "cv_salary_max": cv.salary_expected_max,
-        "cv_qualified": cv.qualified,
+        "cv_contract_type": cv.contract_type,
+        "cv_language_terms": cv.language_terms,
         "weights": result.weights,
         "score_breakdown": result.breakdown,
         "low_confidence_components": result.low_confidence_components,
@@ -2349,30 +2340,28 @@ def get_autonomous_scoring_status(_: None = Depends(require_api_key)) -> Autonom
 
 @app.post("/retrieve")
 def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> dict:
-    """Récupération hybride sur l'ensemble du vivier de CV indexé, en amont
-    du scoring -- remplace le filtrage par titre/mots-clés (LIKE SQL côté
-    WordPress) qui ne peut structurellement pas couvrir tout le vivier.
+    """Tous les CV éligibles pour une offre, en amont du scoring -- "éligible"
+    veut dire "a un document réel extrait avec succès" (cv_embeddings n'en
+    contient pas d'autre, voir reindex_cv_batch), rien de plus. Remplace le
+    filtrage par titre/mots-clés (LIKE SQL côté WordPress) qui ne peut
+    structurellement pas couvrir tout le vivier.
 
-    Trois canaux complémentaires, unis (pas l'un OU l'autre) :
-    - sémantique : similarité cosinus exacte (ivfflat.probes = lists, donc
-      sonde tous les clusters -- pas d'approximation) sur TOUTE la table
-      cv_embeddings, sans restriction de cv_id ;
-    - taxonomie : chevauchement de compétences canoniques ROME, pour ne pas
-      perdre un candidat à la compétence exacte que l'embedding sous-classerait ;
-    - titre : intitulé de candidature correspondant au titre de l'offre
-      (voir fetch_wp_resume_ids_by_title) -- rattrape un candidat que le
-      sémantique/la taxonomie peuvent rater (CV pauvre en texte, compétence
-      absente du référentiel), sans le plafond bas de l'ancien filtrage
-      WordPress en cascade (L1/L2/L3) qu'il remplace en partie.
+    2026-10-07 (pilier Sélection) : plus aucune présélection par ressemblance
+    (sémantique/taxonomie, chacune plafonnée à 300 jusqu'ici) -- exigence
+    explicite "tout CV avec un document réel est évalué, sans exception". Le
+    tri par score réel a toujours lieu plus loin (/score, rank_with_pgvector),
+    sur l'ensemble complet renvoyé ici, pas sur un sous-ensemble choisi par
+    avance. Conséquence directe : plus besoin de calculer un embedding
+    d'offre ni de chercher la compétence commune ici, cette étape ne faisait
+    que decider qui ENTRE -- la décision est maintenant "tout le monde".
 
-    Aucun des trois canaux n'est tronqué arbitrairement en cours de route :
-    chacun remonte son ensemble borné par un vrai critère (similarité,
-    recouvrement, ou -- pour le titre -- la portée déjà étroite d'un filtre
-    propre à une offre précise) ; le tri final par score réel a lieu plus
-    loin, dans /score.
+    titre : intitulé de candidature correspondant au titre de l'offre (voir
+    fetch_wp_resume_ids_by_title) -- gardé uniquement pour l'étiquette
+    d'affichage "titre strict" vs "candidats similaires" côté keoni-bridge
+    (channel_by_id ci-dessous), plus pour exclure qui que ce soit : tout le
+    monde est déjà inclus par la requête d'éligibilité.
 
-    Renvoie les fiches candidat complètes (via keoni-bridge), prêtes pour la
-    suite du pipeline n8n existante (Normalize Job + CV Fast).
+    Renvoie les fiches candidat complètes (via keoni-bridge).
     """
     if not _pgvector_ready:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
@@ -2386,32 +2375,13 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
     if not prepared_job.text:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour cette offre")
 
-    # Un embedding par fenêtre de texte d'offre, pas un seul pour toute
-    # l'offre -- voir le commentaire sur JobEmbeddingChunk (models.py).
-    job_chunk_vectors = encode_texts(
-        [embedding_text(c, "query") for c in chunk_text(prepared_job.text, max_chunks=JOB_CHUNK_LIMIT)]
-    )
-    required_skills = sorted(prepared_job.skills_canonical)
     title_ids = fetch_wp_resume_ids_by_title(job.title or "")
 
     with engine.begin() as conn:
-        conn.execute(text(f"SET LOCAL ivfflat.probes = {settings.ivfflat_lists}"))
+        eligible_rows = conn.execute(select(CvEmbedding.cv_id)).all()
+        eligible_ids = [row.cv_id for row in eligible_rows]
 
-        # Classement sur la meilleure paire (fenêtre d'offre, fenêtre de
-        # CV) -- jamais une moyenne, voir find_cv_ids_by_job_chunks().
-        semantic_rows = find_cv_ids_by_job_chunks(conn, job_chunk_vectors, payload.limit)
-        semantic_ids = [row.cv_id for row in semantic_rows]
-
-        taxonomy_ids: List[int] = []
-        if required_skills:
-            taxonomy_rows = conn.execute(
-                select(CvEmbedding.cv_id)
-                .where(CvEmbedding.skills_canonical.overlap(required_skills))
-                .limit(payload.taxonomy_limit)
-            ).all()
-            taxonomy_ids = [row.cv_id for row in taxonomy_rows]
-
-        combined_ids = list(dict.fromkeys(semantic_ids + taxonomy_ids + title_ids))
+        combined_ids = list(dict.fromkeys(eligible_ids + title_ids))
 
         # Texte déjà extrait au moment du réindex -- injecté dans
         # cached_extracted_text (jamais text_content, voir assemble_cv_text)
@@ -2420,26 +2390,30 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
         # réindexé retombe simplement sur l'extraction à la volée.
         cached_text_by_id = fetch_cached_cv_text(conn, combined_ids)
 
-    # "title" prioritaire sur "similar" quand un CV est retenu par les deux
-    # canaux -- correspondance de titre strict (ex-L1 n8n) est le signal le
-    # plus explicite, affiché comme tel côté keoni-bridge (deux sections
-    # séparées : "titre strict" vs "candidats similaires").
-    channel_by_id: Dict[int, str] = {cv_id: "similar" for cv_id in semantic_ids + taxonomy_ids}
+    # "title" prioritaire sur "similar" -- correspondance de titre stricte
+    # (ex-L1 n8n) est le signal le plus explicite, affiché comme tel côté
+    # keoni-bridge (deux sections séparées : "titre strict" vs "candidats
+    # similaires"). Étiquette d'affichage uniquement, n'affecte plus qui est
+    # inclus (tout le monde l'est déjà via eligible_ids).
+    channel_by_id: Dict[int, str] = {cv_id: "similar" for cv_id in eligible_ids}
     channel_by_id.update({cv_id: "title" for cv_id in title_ids})
 
     cvs = fetch_wp_resumes_by_ids(combined_ids)
     for cv in cvs:
         cv_id = cv.get("id")
-        cached_text = cached_text_by_id.get(cv_id)
-        if cached_text:
-            cv["cached_extracted_text"] = cached_text
+        cached = cached_text_by_id.get(cv_id)
+        if cached:
+            cv["cached_extracted_text"] = cached["text_content"]
+            cv["cached_experience_years"] = cached["experience_years"]
+            cv["cached_contract_type"] = cached["contract_type"]
+            cv["cached_education_text"] = cached["education_text"]
+            cv["cached_language_terms"] = cached["language_terms"]
         cv["retrieval_channel"] = channel_by_id.get(cv_id, "similar")
 
     return {
         "job_id": job.id,
         "count": len(cvs),
-        "semantic_count": len(semantic_ids),
-        "taxonomy_count": len(taxonomy_ids),
+        "eligible_count": len(eligible_ids),
         "title_count": len(title_ids),
         "job": job.model_dump(),
         "cvs": cvs,
@@ -2464,13 +2438,14 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     if not usable:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Aucun texte exploitable pour les CV")
 
-    filtered_usable: List[PreparedCv] = []
-    for cv in usable:
-        ok, _ = passes_hard_filters(job, cv)
-        if ok:
-            filtered_usable.append(cv)
-
-    candidates = filtered_usable if filtered_usable else usable
+    # Plus de filtre dur ici (passes_hard_filters, supprimé 2026-10-06,
+    # pilier Scoring) : comparait des cases de formulaire WordPress
+    # (qualifié/type de contrat/expérience) pour exclure un candidat avant
+    # même le scoring -- décision actée côté pilier Sélection ("tout CV avec
+    # un document réel est évalué, sans exception"), exécutée ici par
+    # nécessité mécanique (ces champs n'existent plus sur PreparedJob/
+    # PreparedCv).
+    candidates = usable
 
     # Les candidats du canal "titre" (retrieve(), voir CvPayload.retrieval_
     # channel) ne doivent jamais se faire évincer par la coupe top_k sur la
@@ -2483,17 +2458,14 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # reste du vivier (sémantique/taxonomie) remplissait à lui seul les
     # top_k places.
     #
-    # Un premier correctif élargissait juste la limite de top_k à
-    # top_k + title_count, en supposant que le reste du vivier tenait déjà
-    # dans top_k -- hypothèse fausse en pratique (retrieve() peut fournir
-    # bien plus de candidats "similar" que top_k à lui seul, constaté en
-    # prod : les 20 candidats "titre" avaient beau exister dans `candidates`
-    # en entrée, aucun ne survivait au classement). Les deux canaux sont
-    # donc classés séparément puis fusionnés : le canal "titre" sans aucune
-    # coupe (nativement étroit), le canal "similar" avec la coupe top_k
-    # habituelle -- toujours triés par la même similarité, aucun passe-droit
-    # sur le score lui-même, juste la garantie que "titre" ne rentre jamais
-    # en concurrence avec "similar" pour une place dans le classement brut.
+    # 2026-10-07 (pilier Sélection) : les deux canaux sont toujours classés
+    # séparément puis fusionnés (le canal "titre" garde sa propre étiquette
+    # d'affichage, voir retrieve()), mais ni l'un ni l'autre n'est plus
+    # coupé à un plafond -- "len(...)" demande le classement de la totalité
+    # de chaque groupe, personne n'est exclu avant le calcul du score.
+    # Avant ce changement, le canal "similar" était coupé à settings.top_k
+    # (200) ici même ; supprimé avec le reste du mécanisme de plafond
+    # (voir aussi retrieve(), qui ne présélectionne plus personne en amont).
     title_candidates = [
         cv for cv in candidates if getattr(cv.payload, "retrieval_channel", None) == "title"
     ]
@@ -2509,25 +2481,32 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
         if ranked_title is None:
             ranked_title = rank_with_faiss(job, title_candidates, len(title_candidates))
 
-    ranked_other = rank_with_pgvector(job, payload.job.id, other_candidates, settings.top_k) if _pgvector_ready else None
+    ranked_other = rank_with_pgvector(
+        job, payload.job.id, other_candidates, len(other_candidates)
+    ) if _pgvector_ready else None
     if ranked_other is None:
-        ranked_other = rank_with_faiss(job, other_candidates, settings.top_k)
+        ranked_other = rank_with_faiss(job, other_candidates, len(other_candidates))
 
     ranked = ranked_title + ranked_other
 
-    # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
-    # ranked reste trié par similarité d'embedding, pas par ce score.
-    rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
+    # 2026-10-07 : relecture fine (cross-encoder) appliquée à TOUT `ranked`,
+    # sans plafond -- exigence explicite "relecture complète pour tous les
+    # CV, sans exception". Avant ce changement, seul le top crossencoder_top_k
+    # (30) recevait cette relecture, les autres gardant la similarité brute
+    # en repli (toujours un score réel, jamais une exclusion -- mais plus
+    # précis pour tout le monde maintenant).
+    rerank_scores = rerank_with_cross_encoder(job, ranked, len(ranked)) if use_cross_encoder else {}
 
-    scored_items: List[ScoreItem] = []
-    for rank, (cv, sim) in enumerate(ranked):
-        if sim < settings.min_similarity:
-            continue
-        scored_items.append(build_score(job, cv, sim, rank, rerank_scores.get(cv.payload.id)))
-
-    if not scored_items and ranked:
-        cv, sim = ranked[0]
-        scored_items.append(build_score(job, cv, sim, 0, rerank_scores.get(cv.payload.id)))
+    # 2026-10-07 (pilier Sélection) : plus de seuil de similarité minimale
+    # ici -- chaque candidat classé reçoit un score réel, quelle que soit sa
+    # similarité d'embedding brute (un score final bas à cause d'un signal
+    # faible n'est pas la même chose qu'une exclusion silencieuse avant même
+    # le calcul). "Tout CV avec un document réel est évalué, sans
+    # exception."
+    scored_items: List[ScoreItem] = [
+        build_score(job, cv, sim, rank, rerank_scores.get(cv.payload.id))
+        for rank, (cv, sim) in enumerate(ranked)
+    ]
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en
@@ -2588,11 +2567,14 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
 
 @app.post("/score-fast", response_model=ScoreResponse)
 def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
-    """Branche rapide : offre récupérée par id, candidats via le même
-    moteur de récupération hybride que la branche autonome (retrieve() --
-    sémantique pgvector + taxonomie + titre, voir son commentaire), pas
-    seulement la correspondance de titre d'origine (L1/L2/L3 remplacés en
-    une seule passe, voir retrieve()) -- pensée pour un retour synchrone
+    """Branche rapide, DÉPRÉCIÉE (2026-10-07) au profit de /score/trigger --
+    gardée telle quelle le temps que keoni-bridge (dépôt séparé) soit
+    republié avec son nouvel appel, sans quoi cet endpoint deviendrait
+    inatteignable alors que la prod l'appelle encore. À retirer une fois
+    confirmé que plus rien ne l'appelle.
+
+    Offre récupérée par id, candidats via le même moteur de récupération
+    que la branche autonome (retrieve()) -- pensée pour un retour synchrone
     quasi instantané au clic sur 'Lancer IA'. Le seul écart restant avec
     /score est l'absence de cross-encoder (use_cross_encoder=False) : la
     recherche pgvector elle-même reste indexée, sans inférence neuronale
@@ -2609,3 +2591,39 @@ def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) ->
     cvs = [resume_to_cv_payload(resume) for resume in resumes]
 
     return _run_score(ScoreRequest(job=job, cvs=cvs), use_cross_encoder=False)
+
+
+@app.post("/score/trigger")
+def trigger_score(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> dict:
+    """Déclenche *immédiatement* un passage complet (relecture fine incluse,
+    sans exception -- voir /score) pour une offre, au lieu d'attendre jusqu'à
+    5 minutes le prochain cycle de scoring autonome (2026-10-07, remplace le
+    chemin rapide /score-fast pour 'Lancer IA').
+
+    Réutilise telle quelle score_job_autonomously() -- fetch l'offre,
+    /retrieve, /score, écrit les résultats côté WordPress
+    (push_matching_results), met à jour JobScoringState -- aucune logique
+    métier dupliquée ici, juste un déclenchement anticipé sur le même pool
+    de workers borné que le cycle autonome (_autonomous_executor), avec le
+    même verrou (_jobs_in_flight) pour éviter deux passages concurrents sur
+    la même offre.
+
+    Répond immédiatement (le calcul continue en tâche de fond) -- pas de
+    résultat dans la réponse HTTP. Même modèle de requête que /score-fast
+    (seul job_id est nécessaire), même schéma réutilisé."""
+    if not _pgvector_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
+
+    job_id = payload.job_id
+
+    with _jobs_in_flight_lock:
+        if job_id in _jobs_in_flight:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cette offre est déjà en cours de scoring")
+        _jobs_in_flight.add(job_id)
+        _autonomous_status["jobs_in_flight"] = len(_jobs_in_flight)
+
+    wp_updated_at = fetch_wp_job_updated_at(job_id)
+    pool_version = get_cv_pool_version()
+    _autonomous_executor.submit(score_job_autonomously, job_id, wp_updated_at, pool_version)
+
+    return {"job_id": job_id, "status": "started"}
