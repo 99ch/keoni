@@ -1,17 +1,4 @@
 name: keoni
-# Stack Keoni IA production.
-# L'image matching-api est buildée par la CI (.github/workflows/ci.yml) et
-# poussée sur GHCR -- ce compose ne fait que la tirer (MATCHING_API_IMAGE /
-# IMAGE_TAG passés en environnement au moment du déploiement, voir le job
-# "deploy" de la CI). Ne plus builder localement sur le serveur de prod.
-#
-# Déploiement (fait par la CI, ou à la main en dépannage) :
-#   export MATCHING_API_IMAGE=ghcr.io/99ch/keoni-matching-api
-#   export IMAGE_TAG=sha-<commit>   # ou "latest"
-#   docker compose --env-file .env.prod -f docker-compose.prod.yml pull matching-api
-#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
-#
-# Tous les ports sont bindés uniquement sur 127.0.0.1 (loopback), jamais exposés publiquement.
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -24,6 +11,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - ./volumes/prod/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     mem_limit: 256m
     cap_drop:
       - ALL
@@ -37,11 +29,6 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     logging:
       driver: json-file
       options:
@@ -49,6 +36,7 @@ services:
         max-file: "5"
     networks:
       - keoni_net
+
   matching-api:
     image: ${MATCHING_API_IMAGE}:${IMAGE_TAG}
     container_name: keoni_matching_api_prod
@@ -57,26 +45,12 @@ services:
     environment:
       MATCHING_API_KEY: ${MATCHING_API_KEY}
       MODEL_CACHE: /models
+      HF_HOME: /models/huggingface
       DATA_DIR: /data/cv_raw
       MATCHING_PRELOAD_MODEL: ${MATCHING_PRELOAD_MODEL:-1}
       MATCHING_MIN_TITLE_HITS: ${MATCHING_MIN_TITLE_HITS:-3}
       POSTGRES_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       TZ: ${TIMEZONE}
-      # Récupération/réindexation sur tout le vivier de CV (/retrieve,
-      # /admin/reindex-cvs) -- même identifiant keoni-bridge que n8n. Défaut
-      # aligné sur l'URL déjà en dur dans le workflow n8n (Fetch CV L1/L2/L3).
-      WP_API_BASE_URL: ${WP_API_BASE_URL:-https://keoni-consulting.net/wp-json/keoni/v1}
-      WP_API_KEY: ${WP_API_KEY}
-      # Scoring autonome (voir app/main.py::run_autonomous_scoring_cycle) --
-      # listées ici explicitement (avec défauts) pour que leur absence dans
-      # .env.prod ne retombe pas silencieusement sur les valeurs par défaut
-      # du code sans que ce soit visible ici.
-      MATCHING_AUTONOMOUS_SCORING_ENABLED: ${MATCHING_AUTONOMOUS_SCORING_ENABLED:-1}
-      MATCHING_AUTONOMOUS_SCORING_INTERVAL_SECONDS: ${MATCHING_AUTONOMOUS_SCORING_INTERVAL_SECONDS:-300}
-      MATCHING_AUTONOMOUS_SCORING_WORKERS: ${MATCHING_AUTONOMOUS_SCORING_WORKERS:-3}
-      MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS: ${MATCHING_AUTONOMOUS_SCORING_CV_WATERMARK_OVERLAP_SECONDS:-600}
-      MATCHING_AUTONOMOUS_SCORING_MIN_RESCORE_INTERVAL_SECONDS: ${MATCHING_AUTONOMOUS_SCORING_MIN_RESCORE_INTERVAL_SECONDS:-3600}
-      MATCHING_AUTONOMOUS_SCORING_INCREMENTAL_REINDEX_ENABLED: ${MATCHING_AUTONOMOUS_SCORING_INCREMENTAL_REINDEX_ENABLED:-1}
     depends_on:
       db:
         condition: service_healthy
@@ -85,24 +59,14 @@ services:
     volumes:
       - ./volumes/models:/models
       - ./volumes/data/cv_raw:/data/cv_raw
-    # 4096m (2026-10-07, remonté depuis 2560m) : le pilier Sélection a retiré
-    # tous les plafonds de présélection ET le plafond de la relecture fine
-    # (crossencoder_top_k) -- chaque offre compare désormais sa relecture
-    # fine contre tout le vivier éligible (33 573 CV en prod), pas 30. Mesuré
-    # en prod le jour du déploiement : un seul passage en cours a fait
-    # grimper le conteneur à 94,81% de l'ancienne limite (2,37/2,5 Go) en
-    # quelques minutes, CPU à 287% -- marge insuffisante pour ce nouveau
-    # volume de travail, le réindex (raison du 2560m d'origine, commentaire
-    # ci-dessous conservé) n'étant plus le poste le plus gourmand. VPS
-    # partagé (4 vCPU/7.6GiB, ~4.4GiB dispo mesuré le 2026-10-07, swap déjà
-    # à 87% avant ce changement -- pas remonté plus haut pour ne pas pousser
-    # le reste de la machine dans le swap).
-    #
-    # Raison d'origine (2560m, 2026-09-23) : le réindex complet (8 workers
-    # concurrents, extraction PDF/OCR + modèle d'embedding chargé) était
-    # mesuré à ~76% de la limite 1536m en usage normal, avec des pics
-    # proches de l'OOM sur les lots contenant plusieurs CV scannés (rendu
-    # pdftoppm haute résolution).
+    # 4096m (2026-10-07, remonte depuis 2560m) : le pilier Selection a retire
+    # le plafond de la relecture fine (crossencoder_top_k) -- chaque offre
+    # compare desormais sa relecture fine contre tout le vivier eligible
+    # (33 573 CV en prod), pas 30. Mesure en prod : un seul passage en cours
+    # a fait grimper le conteneur a 94,81% de l'ancienne limite (2,37/2,5 Go)
+    # en quelques minutes. VPS partage (7.6GiB total, ~4.4GiB dispo mesure le
+    # 2026-10-07) -- pas remonte plus haut pour ne pas pousser le reste de la
+    # machine dans le swap (deja a 87% utilise).
     mem_limit: 4096m
     cap_drop:
       - ALL
@@ -110,11 +74,6 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')\" || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
     logging:
       driver: json-file
       options:
@@ -122,6 +81,7 @@ services:
         max-file: "5"
     networks:
       - keoni_net
+
   n8n:
     image: n8nio/n8n:1.123.10
     container_name: keoni_n8n_prod
@@ -156,11 +116,6 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
     logging:
       driver: json-file
       options:
@@ -168,6 +123,7 @@ services:
         max-file: "5"
     networks:
       - keoni_net
+
 networks:
   keoni_net:
     driver: bridge
