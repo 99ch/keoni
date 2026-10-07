@@ -89,7 +89,6 @@ class Settings:
     crossencoder_model: str = os.getenv(
         "MATCHING_CROSSENCODER_MODEL", "antoinelouis/crossencoder-camembert-large-mmarcoFR"
     )
-    crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "30"))
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -870,6 +869,27 @@ def fetch_wp_job(job_id: int) -> Optional["JobPayload"]:
         location=data.get("location"),
         meta=data.get("meta") if isinstance(data.get("meta"), dict) else None,
     )
+
+
+def fetch_wp_job_updated_at(job_id: int) -> str:
+    """`updated_at` d'une offre (même endpoint que fetch_wp_job, voir
+    class-keoni-bridge-rest.php::get_job -- déjà exposé côté WP mais pas lu
+    par fetch_wp_job, dont la signature ne doit pas changer pour ses autres
+    appelants). Utilisé uniquement par /score/trigger pour que
+    upsert_job_scoring_state (appelé par score_job_autonomously) enregistre
+    une vraie valeur, pas un déclenchement manuel qui fausserait le suivi du
+    cycle autonome. Chaîne vide si indisponible -- score_job_autonomously
+    continue de fonctionner, juste avec un suivi moins précis pour cette
+    offre jusqu'au prochain cycle normal."""
+    if not settings.wp_api_base_url or not settings.wp_api_key:
+        return ""
+    try:
+        url = f"{settings.wp_api_base_url}/wp-json/keoni/v1/job/{job_id}"
+        response = requests.get(url, headers={"X-API-Key": settings.wp_api_key}, timeout=30)
+        response.raise_for_status()
+        return str(response.json().get("updated_at") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def push_matching_results(job_id: int, response: "ScoreResponse") -> None:
@@ -2469,13 +2489,13 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
 
     ranked = ranked_title + ranked_other
 
-    # Le cross-encoder affine seulement le top-k retenu par pgvector/FAISS ;
-    # ranked reste trié par similarité d'embedding, pas par ce score. Ce
-    # plafond-ci (crossencoder_top_k) n'exclut personne du résultat final --
-    # il borne seulement qui reçoit la relecture fine ; un candidat hors de
-    # ce top-k garde quand même un score réel (similarité brute en repli,
-    # voir rerank_scores.get() -> None ci-dessous et compute_final_score).
-    rerank_scores = rerank_with_cross_encoder(job, ranked, settings.crossencoder_top_k) if use_cross_encoder else {}
+    # 2026-10-07 : relecture fine (cross-encoder) appliquée à TOUT `ranked`,
+    # sans plafond -- exigence explicite "relecture complète pour tous les
+    # CV, sans exception". Avant ce changement, seul le top crossencoder_top_k
+    # (30) recevait cette relecture, les autres gardant la similarité brute
+    # en repli (toujours un score réel, jamais une exclusion -- mais plus
+    # précis pour tout le monde maintenant).
+    rerank_scores = rerank_with_cross_encoder(job, ranked, len(ranked)) if use_cross_encoder else {}
 
     # 2026-10-07 (pilier Sélection) : plus de seuil de similarité minimale
     # ici -- chaque candidat classé reçoit un score réel, quelle que soit sa
@@ -2547,11 +2567,14 @@ def score(payload: ScoreRequest, _: None = Depends(require_api_key)) -> ScoreRes
 
 @app.post("/score-fast", response_model=ScoreResponse)
 def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> ScoreResponse:
-    """Branche rapide : offre récupérée par id, candidats via le même
-    moteur de récupération hybride que la branche autonome (retrieve() --
-    sémantique pgvector + taxonomie + titre, voir son commentaire), pas
-    seulement la correspondance de titre d'origine (L1/L2/L3 remplacés en
-    une seule passe, voir retrieve()) -- pensée pour un retour synchrone
+    """Branche rapide, DÉPRÉCIÉE (2026-10-07) au profit de /score/trigger --
+    gardée telle quelle le temps que keoni-bridge (dépôt séparé) soit
+    republié avec son nouvel appel, sans quoi cet endpoint deviendrait
+    inatteignable alors que la prod l'appelle encore. À retirer une fois
+    confirmé que plus rien ne l'appelle.
+
+    Offre récupérée par id, candidats via le même moteur de récupération
+    que la branche autonome (retrieve()) -- pensée pour un retour synchrone
     quasi instantané au clic sur 'Lancer IA'. Le seul écart restant avec
     /score est l'absence de cross-encoder (use_cross_encoder=False) : la
     recherche pgvector elle-même reste indexée, sans inférence neuronale
@@ -2568,3 +2591,39 @@ def score_fast(payload: ScoreFastRequest, _: None = Depends(require_api_key)) ->
     cvs = [resume_to_cv_payload(resume) for resume in resumes]
 
     return _run_score(ScoreRequest(job=job, cvs=cvs), use_cross_encoder=False)
+
+
+@app.post("/score/trigger")
+def trigger_score(payload: ScoreFastRequest, _: None = Depends(require_api_key)) -> dict:
+    """Déclenche *immédiatement* un passage complet (relecture fine incluse,
+    sans exception -- voir /score) pour une offre, au lieu d'attendre jusqu'à
+    5 minutes le prochain cycle de scoring autonome (2026-10-07, remplace le
+    chemin rapide /score-fast pour 'Lancer IA').
+
+    Réutilise telle quelle score_job_autonomously() -- fetch l'offre,
+    /retrieve, /score, écrit les résultats côté WordPress
+    (push_matching_results), met à jour JobScoringState -- aucune logique
+    métier dupliquée ici, juste un déclenchement anticipé sur le même pool
+    de workers borné que le cycle autonome (_autonomous_executor), avec le
+    même verrou (_jobs_in_flight) pour éviter deux passages concurrents sur
+    la même offre.
+
+    Répond immédiatement (le calcul continue en tâche de fond) -- pas de
+    résultat dans la réponse HTTP. Même modèle de requête que /score-fast
+    (seul job_id est nécessaire), même schéma réutilisé."""
+    if not _pgvector_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
+
+    job_id = payload.job_id
+
+    with _jobs_in_flight_lock:
+        if job_id in _jobs_in_flight:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cette offre est déjà en cours de scoring")
+        _jobs_in_flight.add(job_id)
+        _autonomous_status["jobs_in_flight"] = len(_jobs_in_flight)
+
+    wp_updated_at = fetch_wp_job_updated_at(job_id)
+    pool_version = get_cv_pool_version()
+    _autonomous_executor.submit(score_job_autonomously, job_id, wp_updated_at, pool_version)
+
+    return {"job_id": job_id, "status": "started"}
