@@ -241,7 +241,7 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     # gardés uniquement sous leur forme qualifiée, "Consul" sans alias nu
     # -- collision avec le mot français "consul").
     "Scikit-learn": ["scikit learn", "scikit-learn", "sklearn"],
-    "Pandas": ["pandas dataframe", "pandas python"],
+    "Pandas": ["pandas dataframe", "pandas python", "pandas"],
     "NumPy": ["numpy"],
     "Jupyter": ["jupyter", "jupyter notebook", "jupyterlab"],
     "Hugging Face": ["hugging face", "huggingface", "transformers library"],
@@ -1084,7 +1084,7 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Audiologie": ["audiologie"],
     "AutoCAD Civil 3D": ["autocad civil 3d"],
     "Autodesk Revit": ["autodesk revit"],
-    "Automate programmable": ["automate programmable"],
+    "Automate programmable": ["automate programmable", "plc", "programmable logic controller"],
     "Autopartage": ["autopartage"],
     "Azéri": ["azeri"],
     "Aéraulique": ["aeraulique"],
@@ -2382,6 +2382,28 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "SLA/SLO": ["sla", "slo", "sli", "mttr"],
     "Managed File Transfer": ["managed file transfer", "mft"],
     "S2I": ["s2i", "source-to-image"],
+
+    # ── AJOUTS 2026-10-08 (lot 3) -- audit ciblé mobile/web/IA-data/télécom/
+    # robotique (demande explicite, suite à l'inquiétude sur la couverture
+    # tech) : vérifié terme par terme via normalize_skill() avant d'ajouter
+    # quoi que ce soit -- mobile et web s'avèrent déjà bien couverts
+    # (Swift/Kotlin/Flutter/React Native/Android/iOS/Django/Laravel/
+    # Symfony/WordPress tous déjà détectés), télécom et robotique
+    # confirmés faibles (seuls Cisco et Automate programmable l'étaient) ──
+    "Nuxt.js": ["nuxt.js", "nuxtjs", "nuxt"],
+    "Svelte": ["svelte", "sveltekit"],
+    "Webpack": ["webpack"],
+    "Vite": ["vite", "vitejs"],
+    "Keras": ["keras"],
+    "5G": ["5g", "reseau 5g"],
+    "4G/LTE": ["4g", "lte", "4g/lte"],
+    "VoIP": ["voip", "voice over ip"],
+    "SIP": ["sip", "session initiation protocol"],
+    "SDN": ["sdn", "software defined networking"],
+    "NFV": ["nfv", "network functions virtualization"],
+    "Huawei": ["huawei"],
+    "ROS": ["ros", "robot operating system"],
+    "SCADA": ["scada"],
 
     # ── AJOUTS PROPRES À KEONI (sans équivalent chez AI Real-Time) ─────────
     # jQuery a existé ici comme ajout Keoni jusqu'au portage de 2561ad5, qui
