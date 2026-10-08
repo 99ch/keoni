@@ -1305,7 +1305,13 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Développement social": ["developpement social"],
     "Développement économique": ["developpement economique"],
     "E Business": ["e business"],
-    "Eclipse IDE": ["eclipse ide", "eclipse"],
+    # "eclipse" nu retiré (2026-10-08) : régression réintroduite par
+    # erreur -- collision documentée avec le mot français "éclipse"
+    # (phénomène astronomique), voir test_onet_skills_import.py côté AI
+    # Real-Time (146 CV/1491, 10%, validation 2026-09-17) -- absent des
+    # tests Keoni, gap de couverture qui a laissé passer cette régression
+    # localement. "Eclipse IDE" en phrase complète reste le seul alias sûr.
+    "Eclipse IDE": ["eclipse ide"],
     "Eco-conception": ["eco-conception"],
     "Ecologie": ["ecologie"],
     "Economie de la construction": ["economie de la construction"],
