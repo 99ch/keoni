@@ -40,7 +40,9 @@ rome_skills_data.json).
 
 from __future__ import annotations
 
+import difflib
 import json
+import os
 import re
 import unicodedata
 from functools import lru_cache
@@ -2501,13 +2503,119 @@ def normalize_skill(term: str) -> str | None:
     return _load_lookup().get(_fold(term.strip()))
 
 
+# Repli liste-blanche + flou de find_skills() (ci-dessous) -- portage de
+# _BUILTIN_SKILL_SYNONYMS/_skill_whitelist/_apply_synonyms côté AI
+# Real-Time (backend/app/services/taxonomy.py, structured_constants.py),
+# absent jusqu'ici côté Keoni : find_skills() n'y faisait que la passe 1
+# (recherche n-gramme dans la taxonomie), sans liste blanche réglable ni
+# tolérance aux fautes de frappe -- un écart réel confirmé par audit
+# (2026-10-08) entre les deux plateformes, à l'origine de scores
+# potentiellement différents pour un même CV/offre.
+_BUILTIN_SKILL_SYNONYMS: Dict[str, str] = {
+    "js": "javascript",
+    "javascript": "javascript",
+    "ts": "typescript",
+    "typescript": "typescript",
+    "node js": "nodejs",
+    "nodejs": "nodejs",
+    "node": "nodejs",
+    "node js express": "nodejs",
+    "node js api": "nodejs",
+    "node js backend": "nodejs",
+    "postgres": "postgresql",
+    "postgresql": "postgresql",
+    "py": "python",
+    "python": "python",
+    "c#": "csharp",
+    "c sharp": "csharp",
+    "c++": "cplusplus",
+    "c plus plus": "cplusplus",
+    "react js": "react",
+    "reactjs": "react",
+    "react": "react",
+    "vue js": "vue",
+    "vuejs": "vue",
+    "vue": "vue",
+    "fast api": "fastapi",
+    "fastapi": "fastapi",
+    "docker": "docker",
+    "k8s": "kubernetes",
+    "kubernetes": "kubernetes",
+    "aws": "aws",
+    "azure": "azure",
+    "ml": "machinelearning",
+    "machine learning": "machinelearning",
+    "data science": "datascience",
+}
+
+# Mêmes valeurs par défaut que settings.scoring_skill_keywords/
+# scoring_synonyms côté AI Real-Time -- lus une fois au chargement du
+# module (même convention que OCR_MIN_TEXT_LENGTH etc. dans extraction.py),
+# réglables via variable d'environnement sans toucher au code.
+_SKILL_KEYWORDS_ENV = os.getenv(
+    "MATCHING_SCORING_SKILL_KEYWORDS",
+    "python,sql,postgresql,fastapi,docker,kubernetes,aws,azure,linux,git,"
+    "communication,project management,teamwork,leadership,"
+    "customer service,sales,negotiation,reporting,"
+    "marketing,accounting",
+)
+_SYNONYMS_ENV = os.getenv(
+    "MATCHING_SCORING_SYNONYMS",
+    "js=javascript,ts=typescript,nodejs=node,postgres=postgresql,py=python",
+)
+
+
+def _parse_synonyms(raw: str) -> Dict[str, str]:
+    pairs: Dict[str, str] = {}
+    for item in (chunk.strip() for chunk in raw.split(",") if chunk.strip()):
+        if "=" not in item:
+            continue
+        src, dest = item.split("=", 1)
+        src_folded = _fold(src).replace(".", " ")
+        dest_folded = _fold(dest).replace(".", " ")
+        if src_folded and dest_folded:
+            pairs[src_folded] = dest_folded
+    return pairs
+
+
+@lru_cache(maxsize=1)
+def _skill_synonyms() -> Dict[str, str]:
+    mapping = dict(_BUILTIN_SKILL_SYNONYMS)
+    mapping.update(_parse_synonyms(_SYNONYMS_ENV))
+    return mapping
+
+
+def _apply_synonyms(text: str) -> str:
+    result = _fold(text).replace(".", " ")
+    for source, target in sorted(_skill_synonyms().items(), key=lambda item: len(item[0]), reverse=True):
+        if not source or not target or source == target:
+            continue
+        result = re.sub(rf"\b{re.escape(source)}\b", target, result)
+    return re.sub(r"\s+", " ", result).strip()
+
+
+@lru_cache(maxsize=1)
+def _skill_whitelist() -> List[str]:
+    parts = [p.strip() for p in re.split(r"[,;]+", _SKILL_KEYWORDS_ENV) if p.strip()]
+    return [_apply_synonyms(p) for p in parts]
+
+
 def find_skills(text: str, max_results: int = 50) -> List[str]:
     """Compétences détectées dans un texte libre (offre ou CV), dédupliquées,
-    dans l'ordre de première apparition. Scan glouton du plus long n-gramme au
-    plus court pour éviter qu'un match partiel ne casse un libellé multi-mots.
-    Les traits comportementaux (SOFT_SKILL_CANONICALS) et le vocabulaire
-    générique (_GENERIC_SKILL_CANONICALS) sont détectés (les tokens sont
-    consommés) mais jamais renvoyés comme compétence.
+    dans l'ordre de première apparition. Trois passes, comme côté AI
+    Real-Time :
+    1. Recherche n-gramme dans la taxonomie (l'essentiel de la détection --
+       scan glouton du plus long n-gramme au plus court pour éviter qu'un
+       match partiel ne casse un libellé multi-mots). Les traits
+       comportementaux (SOFT_SKILL_CANONICALS) et le vocabulaire générique
+       (_GENERIC_SKILL_CANONICALS) sont détectés (les tokens sont
+       consommés) mais jamais renvoyés comme compétence.
+    2. Liste blanche réglable (MATCHING_SCORING_SKILL_KEYWORDS), match exact
+       en mot-entier sur un texte normalisé par synonymes -- permet
+       d'étendre la détection sans toucher à la taxonomie.
+    3. Repli flou (tolérant aux fautes de frappe, ex. "Pyhton" -> "python")
+       pour les entrées de cette même liste blanche qui n'ont pas matché
+       exactement.
     """
     lookup = _load_lookup()
     if not lookup or not text:
@@ -2522,28 +2630,83 @@ def find_skills(text: str, max_results: int = 50) -> List[str]:
 
     found: List[str] = []
     seen: set[str] = set()
-    i = 0
     n = len(tokens)
 
-    while i < n:
-        matched = False
-        for size in range(min(_MAX_NGRAM, n - i), 0, -1):
+    # Portage verbatim de l'algorithme AI Real-Time (2026-10-08, audit de
+    # parité) : balaie CHAQUE taille de n-gramme (la plus longue d'abord)
+    # sur TOUTES les positions, sans "consommer" les tokens d'un match plus
+    # long -- une version précédente de cette boucle avançait l'index dès
+    # que la plus longue correspondance gagnait à une position donnée. Un
+    # sous-groupe de mots peut donc matcher SON PROPRE alias même s'il fait
+    # déjà partie d'un match plus long : "pilotage de projet" matche
+    # "Gestion de projet" (3-gramme) ET, séparément, "pilotage" matche
+    # aussi "Gouvernance" (1-gramme) -- les deux sont gardés. Trouvé en
+    # auditant Keoni contre AI Real-Time : l'ancienne version consommante
+    # ratait systématiquement ce genre de compétence imbriquée, un écart
+    # réel de détection entre les deux plateformes.
+    for size in range(min(_MAX_NGRAM, n), 0, -1):
+        for i in range(n - size + 1):
+            if len(found) >= max_results:
+                break
             candidate = " ".join(tokens[i : i + size])
             canonical = lookup.get(_fold(candidate))
-            if canonical:
-                # Vocabulaire générique/traits comportementaux (voir
-                # _EXCLUDED_FROM_HARD_SKILLS) : les tokens sont bien
-                # consommés (pas de rescan à une taille plus courte), mais
-                # le "match" n'est jamais ajouté aux compétences détectées.
-                if canonical not in _EXCLUDED_FROM_HARD_SKILLS and canonical not in seen:
+            if not canonical:
+                continue
+            # Vocabulaire générique/traits comportementaux (voir
+            # _EXCLUDED_FROM_HARD_SKILLS) : détecté mais jamais renvoyé
+            # comme compétence.
+            if canonical in _EXCLUDED_FROM_HARD_SKILLS or canonical in seen:
+                continue
+            seen.add(canonical)
+            found.append(canonical)
+        if len(found) >= max_results:
+            break
+
+    # Passe 2 : liste blanche, match exact en mot-entier -- portage de
+    # find_skills() côté AI Real-Time. _skill_whitelist() applique déjà
+    # _apply_synonyms() à chaque entrée à la construction ; `synonymized`
+    # fait de même sur le texte source, donc les deux côtés sont comparés
+    # sur la même forme normalisée (ex. whitelist "postgresql" matche un
+    # texte source écrivant "postgres").
+    if len(found) < max_results:
+        synonymized = _apply_synonyms(text)
+        for raw_skill in _skill_whitelist():
+            if not raw_skill:
+                continue
+            if len(found) >= max_results:
+                break
+            canonical = normalize_skill(raw_skill) or raw_skill
+            if canonical in _EXCLUDED_FROM_HARD_SKILLS or canonical in seen:
+                continue
+            if re.search(rf"\b{re.escape(raw_skill)}\b", synonymized):
+                seen.add(canonical)
+                found.append(canonical)
+
+        # Passe 3 : repli flou (difflib, seuil 0.8), uniquement pour les
+        # entrées de la liste blanche qui n'ont pas matché exactement --
+        # jamais sur le reste de la taxonomie (risque de faux positifs trop
+        # élevé à cette échelle).
+        if len(found) < max_results:
+            fuzzy_words = re.findall(r"[a-z0-9+.#]+", synonymized)
+            for raw_skill in _skill_whitelist():
+                if not raw_skill:
+                    continue
+                if len(found) >= max_results:
+                    break
+                canonical = normalize_skill(raw_skill) or raw_skill
+                if canonical in _EXCLUDED_FROM_HARD_SKILLS or canonical in seen:
+                    continue
+                # difflib.ratio() n'est pas fiable sous ~4 caractères : "git"
+                # (3) vs l'acronyme métier "it" (2, comme dans "stratégie IT
+                # du groupe") scorent exactement le seuil 0.8 -- toute
+                # mention de "IT" déclencherait Git comme compétence requise
+                # sur une offre business sans aucun contenu technique. Même
+                # garde-fou que _ROME_ALIAS_STOPWORDS plus haut, portage
+                # verbatim du seuil AI Real-Time.
+                if len(raw_skill) < 4:
+                    continue
+                if difflib.get_close_matches(raw_skill.lower(), fuzzy_words, n=1, cutoff=0.8):
                     seen.add(canonical)
                     found.append(canonical)
-                    if len(found) >= max_results:
-                        return found
-                i += size
-                matched = True
-                break
-        if not matched:
-            i += 1
 
     return found
