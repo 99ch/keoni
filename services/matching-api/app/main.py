@@ -34,6 +34,7 @@ from app import extraction
 from app.db import get_engine, init_db
 from app.document_profile import build_document_profile
 from app.models import CvEmbedding, CvEmbeddingChunk, JobEmbedding, JobEmbeddingChunk, JobScoringState
+from app.pool_refresh import refresh_pool
 from app.scoring import (
     CV_CHUNK_LIMIT,
     DEFAULT_WEIGHTS,
@@ -183,6 +184,11 @@ class Settings:
     autonomous_scoring_incremental_reindex_enabled: bool = (
         os.getenv("MATCHING_AUTONOMOUS_SCORING_INCREMENTAL_REINDEX_ENABLED", "1") == "1"
     )
+    # "Lancer IA" (/score/trigger) indexe d'abord les CV nouveaux/modifiés
+    # (voir refresh_cv_pool_now) : durée maximale d'attente d'un passage de
+    # réindexation déjà en cours avant de scorer quand même, sur un vivier
+    # possiblement incomplet (journalisé).
+    trigger_refresh_max_wait_seconds: int = int(os.getenv("MATCHING_TRIGGER_REFRESH_MAX_WAIT_SECONDS", "1800"))
 
 
 settings = Settings()
@@ -1382,14 +1388,65 @@ def upsert_job_scoring_state(job_id: int, wp_updated_at: str, pool_version: date
         conn.execute(stmt)
 
 
-def score_job_autonomously(job_id: int, wp_updated_at: str, pool_version: datetime) -> None:
+def reindex_modified_cvs() -> None:
+    """Un passage de réindexation CV incrémental : seulement les CV modifiés
+    depuis le plus récent déjà indexé (moins une marge de sécurité, voir
+    autonomous_scoring_cv_watermark_overlap_seconds) -- jamais tout le
+    vivier, sauf si cv_embeddings est vide. Partagé par le cycle autonome et
+    par "Lancer IA" (refresh_cv_pool_now). Rend la main tout de suite si un
+    passage incrémental tourne déjà (voir run_full_reindex)."""
+    overlap = timedelta(seconds=settings.autonomous_scoring_cv_watermark_overlap_seconds)
+    watermark = get_cv_pool_version()
+    modified_since = None
+    if watermark is not None:
+        modified_since = (watermark - overlap).strftime("%Y-%m-%d %H:%M:%S")
+
+    run_full_reindex(
+        modified_since=modified_since,
+        lock=_incremental_reindex_lock,
+        status=_incremental_reindex_status,
+    )
+
+
+def refresh_cv_pool_now() -> bool:
+    """Indexe les CV nouveaux/modifiés AVANT de scorer, pour que "Lancer IA"
+    voie tout le vivier même si le cycle autonome n'est pas encore passé (ou
+    est coupé) -- /retrieve ne lit que cv_embeddings, il n'indexe rien. Voir
+    app/pool_refresh.py pour l'attente d'un passage déjà en cours. Renvoie
+    False si le délai d'attente est dépassé."""
+    return refresh_pool(
+        lambda: bool(_incremental_reindex_status["running"]),
+        reindex_modified_cvs,
+        max_wait_seconds=settings.trigger_refresh_max_wait_seconds,
+    )
+
+
+def score_job_autonomously(
+    job_id: int, wp_updated_at: str, pool_version: datetime, refresh_cvs: bool = False
+) -> None:
     """Pipeline complet pour une offre, exécuté par le pool de workers du
     scoring autonome -- mêmes étapes que ce que fait déjà n8n pour "Lancer
     IA" (fetch job, /retrieve, /score, écriture des résultats), mais
     `retrieve()`/`score()` appelées directement en interne (fonctions
     Python pures, voir leur définition plus bas) plutôt qu'en repassant
-    par HTTP sur soi-même."""
+    par HTTP sur soi-même.
+
+    `refresh_cvs=True` (déclenchement manuel, /score/trigger) : indexe
+    d'abord les CV nouveaux/modifiés -- le cycle autonome, lui, l'a déjà fait
+    en tête de cycle."""
     try:
+        if refresh_cvs:
+            if not refresh_cv_pool_now():
+                logging.warning(
+                    "Scoring manuel: offre %s scorée sans attendre la fin de la réindexation CV "
+                    "(délai dépassé) -- le vivier peut être incomplet",
+                    job_id,
+                )
+            # Version du vivier après réindexation : c'est elle qu'on
+            # enregistre dans JobScoringState, sinon le cycle autonome
+            # croirait le vivier "avancé" depuis ce scoring et le referait.
+            pool_version = get_cv_pool_version() or pool_version
+
         job = fetch_wp_job(job_id)
         if job is None:
             logging.info("Scoring autonome: offre %s introuvable, ignorée", job_id)
@@ -1441,17 +1498,7 @@ def run_autonomous_scoring_cycle() -> None:
 
     try:
         if settings.autonomous_scoring_incremental_reindex_enabled:
-            overlap = timedelta(seconds=settings.autonomous_scoring_cv_watermark_overlap_seconds)
-            watermark = get_cv_pool_version()
-            modified_since = None
-            if watermark is not None:
-                modified_since = (watermark - overlap).strftime("%Y-%m-%d %H:%M:%S")
-
-            run_full_reindex(
-                modified_since=modified_since,
-                lock=_incremental_reindex_lock,
-                status=_incremental_reindex_status,
-            )
+            reindex_modified_cvs()
 
         pool_version = get_cv_pool_version()
 
@@ -2619,13 +2666,18 @@ def trigger_score(payload: ScoreFastRequest, _: None = Depends(require_api_key))
     5 minutes le prochain cycle de scoring autonome (2026-10-07, remplace le
     chemin rapide /score-fast pour 'Lancer IA').
 
-    Réutilise telle quelle score_job_autonomously() -- fetch l'offre,
-    /retrieve, /score, écrit les résultats côté WordPress
-    (push_matching_results), met à jour JobScoringState -- aucune logique
-    métier dupliquée ici, juste un déclenchement anticipé sur le même pool
-    de workers borné que le cycle autonome (_autonomous_executor), avec le
-    même verrou (_jobs_in_flight) pour éviter deux passages concurrents sur
-    la même offre.
+    Réutilise score_job_autonomously() -- fetch l'offre, /retrieve, /score,
+    écrit les résultats côté WordPress (push_matching_results), met à jour
+    JobScoringState -- aucune logique métier dupliquée ici, juste un
+    déclenchement anticipé sur le même pool de workers borné que le cycle
+    autonome (_autonomous_executor), avec le même verrou (_jobs_in_flight)
+    pour éviter deux passages concurrents sur la même offre.
+
+    Contrairement au cycle autonome, indexe d'abord les CV nouveaux ou
+    modifiés (refresh_cvs=True, seulement ceux-là, voir
+    reindex_modified_cvs) : /retrieve ne lit que cv_embeddings, donc sans
+    cela les CV ajoutés depuis le dernier passage seraient ignorés en
+    silence si la boucle est coupée ou pas encore passée.
 
     Répond immédiatement (le calcul continue en tâche de fond) -- pas de
     résultat dans la réponse HTTP. Même modèle de requête que /score-fast
@@ -2643,6 +2695,6 @@ def trigger_score(payload: ScoreFastRequest, _: None = Depends(require_api_key))
 
     wp_updated_at = fetch_wp_job_updated_at(job_id)
     pool_version = get_cv_pool_version()
-    _autonomous_executor.submit(score_job_autonomously, job_id, wp_updated_at, pool_version)
+    _autonomous_executor.submit(score_job_autonomously, job_id, wp_updated_at, pool_version, True)
 
     return {"job_id": job_id, "status": "started"}
