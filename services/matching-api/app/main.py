@@ -1435,6 +1435,7 @@ def score_job_autonomously(
     d'abord les CV nouveaux/modifiés -- le cycle autonome, lui, l'a déjà fait
     en tête de cycle."""
     try:
+        t_start = time.perf_counter()
         if refresh_cvs:
             if not refresh_cv_pool_now():
                 logging.warning(
@@ -1446,6 +1447,7 @@ def score_job_autonomously(
             # enregistre dans JobScoringState, sinon le cycle autonome
             # croirait le vivier "avancé" depuis ce scoring et le referait.
             pool_version = get_cv_pool_version() or pool_version
+        t_indexed = time.perf_counter()
 
         job = fetch_wp_job(job_id)
         if job is None:
@@ -1457,6 +1459,7 @@ def score_job_autonomously(
         if not cvs:
             logging.info("Scoring autonome: offre %s sans candidat retenu par /retrieve", job_id)
             return
+        t_retrieved = time.perf_counter()
 
         # resume_to_cv_payload() (pas CvPayload(**cv) direct) : les CV
         # renvoyés par /retrieve sont au format WP brut (normalize_resume()
@@ -1465,8 +1468,28 @@ def score_job_autonomously(
         # /score ; ici on appelle score() en interne, donc c'est cette
         # fonction qui doit s'en charger, comme le fait déjà reindex_cv_text().
         response = score(ScoreRequest(job=job, cvs=[resume_to_cv_payload(cv) for cv in cvs]), None)
+        t_scored = time.perf_counter()
         push_matching_results(job_id, response)
         upsert_job_scoring_state(job_id, wp_updated_at, pool_version)
+        t_done = time.perf_counter()
+
+        # Durée par étape -- sert à mesurer la rapidité réelle de "Lancer IA"
+        # (réindexation incrémentale + lecture du vivier + calcul + écriture
+        # WordPress) sans avoir à chronométrer à la main.
+        logging.info(
+            "Scoring %s terminé pour l'offre %s en %.1fs : réindexation CV %.1fs, "
+            "lecture du vivier %.1fs, calcul %.1fs, écriture WordPress %.1fs "
+            "(%d CV lus, %d résultats)",
+            "manuel" if refresh_cvs else "autonome",
+            job_id,
+            t_done - t_start,
+            t_indexed - t_start,
+            t_retrieved - t_indexed,
+            t_scored - t_retrieved,
+            t_done - t_scored,
+            len(cvs),
+            response.count,
+        )
 
         with _jobs_in_flight_lock:
             _autonomous_status["jobs_rescored_last_cycle"] += 1
