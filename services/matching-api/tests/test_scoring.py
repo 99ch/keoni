@@ -28,6 +28,7 @@ from app.scoring import (  # noqa: E402
     normalize_whitespace,
     priority_keyword_component,
     resolve_priority_keywords,
+    select_rerank_shortlist,
     set_skill_embedding_tuning,
     skills_component,
     split_priority_keyword_terms,
@@ -649,3 +650,29 @@ def test_cv_chunk_limit_is_strictly_more_generous_than_job_chunk_limit():
     # Une offre dépasse rarement 1-2 pages, un CV peut en faire 4-5 --
     # voir le commentaire sur JOB_CHUNK_LIMIT/CV_CHUNK_LIMIT.
     assert CV_CHUNK_LIMIT > JOB_CHUNK_LIMIT
+
+
+def test_rerank_shortlist_picks_the_best_scores_best_first():
+    scores = [10.0, 80.0, 55.0, 90.0, 30.0]
+    assert select_rerank_shortlist(scores, 3) == [3, 1, 2]
+
+
+def test_rerank_shortlist_breaks_ties_by_lowest_index():
+    # Résultat déterministe : sans cela, deux appels identiques pourraient
+    # relire des CV différents à la frontière du top-k.
+    assert select_rerank_shortlist([50.0, 70.0, 70.0, 50.0], 3) == [1, 2, 0]
+
+
+def test_rerank_shortlist_takes_everyone_when_top_k_exceeds_candidates():
+    assert select_rerank_shortlist([1.0, 3.0, 2.0], 100) == [1, 2, 0]
+
+
+@pytest.mark.parametrize("top_k", [0, -1, -100])
+def test_rerank_shortlist_is_empty_when_top_k_is_not_positive(top_k):
+    # 0 = relecture désactivée ; une valeur négative ne doit pas devenir
+    # un découpage depuis la fin de la liste.
+    assert select_rerank_shortlist([1.0, 2.0, 3.0], top_k) == []
+
+
+def test_rerank_shortlist_handles_no_candidates():
+    assert select_rerank_shortlist([], 100) == []

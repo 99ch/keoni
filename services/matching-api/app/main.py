@@ -45,6 +45,7 @@ from app.scoring import (
     compute_final_score,
     get_skill_embedding_tuning,
     normalize_whitespace,
+    select_rerank_shortlist,
     strip_html,
     set_skill_embedding_tuning,
     split_priority_keyword_terms,
@@ -89,6 +90,14 @@ class Settings:
     crossencoder_model: str = os.getenv(
         "MATCHING_CROSSENCODER_MODEL", "antoinelouis/crossencoder-camembert-large-mmarcoFR"
     )
+    # Nombre de candidats (par offre) relus finement par le cross-encoder,
+    # après un premier classement sur le score complet sans lui. Tous les CV
+    # gardent un score réel ; seuls les meilleurs sont relus et reclassés.
+    # Raison : la relecture coûte 20 à 90 s par CV sur CPU (jusqu'à 128 paires
+    # fenêtre-offre x fenêtre-CV) et ne pèse que 0.10 du score final -- la
+    # faire sur les ~33 000 CV demandait plusieurs jours par offre, aucune
+    # n'aboutissait (constaté en prod, 2026-10-12). 0 = pas de relecture.
+    crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "100"))
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -2489,14 +2498,6 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
 
     ranked = ranked_title + ranked_other
 
-    # 2026-10-07 : relecture fine (cross-encoder) appliquée à TOUT `ranked`,
-    # sans plafond -- exigence explicite "relecture complète pour tous les
-    # CV, sans exception". Avant ce changement, seul le top crossencoder_top_k
-    # (30) recevait cette relecture, les autres gardant la similarité brute
-    # en repli (toujours un score réel, jamais une exclusion -- mais plus
-    # précis pour tout le monde maintenant).
-    rerank_scores = rerank_with_cross_encoder(job, ranked, len(ranked)) if use_cross_encoder else {}
-
     # 2026-10-07 (pilier Sélection) : plus de seuil de similarité minimale
     # ici -- chaque candidat classé reçoit un score réel, quelle que soit sa
     # similarité d'embedding brute (un score final bas à cause d'un signal
@@ -2504,9 +2505,27 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # le calcul). "Tout CV avec un document réel est évalué, sans
     # exception."
     scored_items: List[ScoreItem] = [
-        build_score(job, cv, sim, rank, rerank_scores.get(cv.payload.id))
-        for rank, (cv, sim) in enumerate(ranked)
+        build_score(job, cv, sim, rank, None) for rank, (cv, sim) in enumerate(ranked)
     ]
+
+    # Relecture fine (cross-encoder) limitée aux crossencoder_top_k meilleurs
+    # sur ce score complet : le cross-encoder ne pèse que 0.10 du score final
+    # mais coûte 20 à 90 s par CV sur CPU. Appliquée à tout le vivier
+    # (2026-10-07 -> 2026-10-12, "relecture complète pour tous les CV"), une
+    # seule offre demandait des jours de calcul et aucune n'aboutissait. Les
+    # CV hors du top gardent leur score réel (similarité cosinus à la place du
+    # score cross-encoder) -- jamais une exclusion. Seuls les candidats relus
+    # sont recalculés avec leur score cross-encoder.
+    if use_cross_encoder and settings.crossencoder_enabled:
+        shortlist = select_rerank_shortlist(
+            [item.score for item in scored_items], settings.crossencoder_top_k
+        )
+        rerank_scores = rerank_with_cross_encoder(
+            job, [ranked[i] for i in shortlist], len(shortlist)
+        )
+        for i in shortlist:
+            cv, sim = ranked[i]
+            scored_items[i] = build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id))
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en

@@ -173,6 +173,20 @@ def chunk_text(value: str, max_chars: int = 800, max_chunks: int = 8) -> list[st
     return chunks[:max_chunks] or [""]
 
 
+def select_rerank_shortlist(scores: Sequence[float], top_k: int) -> list[int]:
+    """Indices des `top_k` meilleurs scores, du meilleur au moins bon (égalité :
+    l'indice le plus petit d'abord, donc le résultat est déterministe).
+
+    Sert à choisir quels candidats reçoivent la relecture fine du cross-encoder
+    (coûteuse, plusieurs dizaines de secondes par CV sur CPU) : tous les CV
+    ont déjà un score complet sans elle, seuls les meilleurs sont relus et
+    reclassés. `top_k` <= 0 désactive la relecture (liste vide) ; `top_k`
+    plus grand que le nombre de candidats les prend tous.
+    """
+    limit = max(0, top_k)
+    return sorted(range(len(scores)), key=lambda i: (-scores[i], i))[:limit]
+
+
 @dataclass(slots=True)
 class PreparedJob:
     text: str
