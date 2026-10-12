@@ -8,7 +8,7 @@ commentaires) — pas des cas hypothétiques.
 
 from __future__ import annotations
 
-from app.taxonomy import find_skills, normalize_skill
+from app.taxonomy import LANGUAGE_CANONICALS, WEAK_SKILL_CANONICALS, find_skills, normalize_skill
 
 
 # ── Faux positif "vue" (AI Real-Time 36673c6/69112d5) ──────────────────────
@@ -104,3 +104,23 @@ def test_dev_web_and_developpeur_web_are_the_same_canonical():
 def test_empty_or_missing_text_returns_empty_list():
     assert find_skills("") == []
     assert find_skills("   ") == []
+
+
+# ── Langues et compétences à faible pouvoir discriminant (2026-10-12) ───────
+
+
+def test_language_names_are_not_returned_as_skills():
+    # Évaluées par la composante "langues" : les compter aussi comme compétence
+    # donnait une couverture gratuite à tout CV écrit en français.
+    assert find_skills("Langues : Français, Espagnol, Arabe. Python") == ["Python"]
+    for name in LANGUAGE_CANONICALS:
+        assert name not in find_skills(f"Maîtrise de l'{name} courant")
+
+
+def test_weak_skills_are_still_detected_so_they_can_be_down_weighted():
+    # Elles ne sont pas retirées : une offre "Product Owner" doit pouvoir les
+    # exiger. C'est le calcul de la couverture qui les pondère.
+    text = "cycle de vie du projet, parties prenantes, compliance, SGBD, Scrum, Product Owner, Agile"
+    found = set(find_skills(text))
+    assert {"Cycle", "Parties prenantes", "Compliance", "SGBD", "Scrum", "Product Owner", "Agile"} <= found
+    assert found & WEAK_SKILL_CANONICALS

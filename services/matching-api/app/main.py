@@ -52,10 +52,11 @@ from app.scoring import (
     strip_html,
     set_skill_embedding_tuning,
     active_priority_keyword_terms,
+    build_skill_weights,
     tokenize,
     weights_for_profile,
 )
-from app.taxonomy import find_skills
+from app.taxonomy import LANGUAGE_CANONICALS, WEAK_SKILL_CANONICALS, find_skills
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -729,6 +730,14 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     # offre, cohérent avec l'existant).
     document_profile = build_document_profile(text)
 
+    # Années d'expérience demandées : le champ WordPress s'il est renseigné,
+    # sinon celles lues dans le TEXTE de l'offre ("minimum 7 années
+    # d'expérience"), comme le fait AI Real-Time. Avant, seul le champ était
+    # lu : une offre dont l'exigence n'était que dans le texte n'avait aucun
+    # signal d'expérience (la composante était exclue du score).
+    if min_experience_years is None and document_profile.experience_years > 0:
+        min_experience_years = float(document_profile.experience_years)
+
     # job.keywords brut (avant dédup) alimente PUREMENT le mécanisme
     # "mots-clés prioritaires" (couverture + pénalité core-keyword) -- voir
     # le commentaire en tête de section dans app/scoring.py. job.keywords
@@ -740,13 +749,19 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     keyword_terms_raw = active_priority_keyword_terms(job.keywords, settings.priority_keywords_enabled)
     scoring_profile = job.scoring_profile or normalized_text(find_first(meta, ["scoring_profile", "profil_scoring"])) or None
 
+    skills_canonical = set(find_skills(text))
+    skill_weights = build_skill_weights(
+        skills_canonical, find_skills(job.title or ""), WEAK_SKILL_CANONICALS
+    )
+
     return PreparedJob(
         text=text,
         semantic_text=semantic_text,
         tokens=tokens,
         keywords=keywords,
         keyword_set=set(keywords),
-        skills_canonical=set(find_skills(text)),
+        skills_canonical=skills_canonical,
+        skill_weights=skill_weights,
         min_experience_years=min_experience_years,
         title=job.title or "",
         keyword_terms_raw=keyword_terms_raw,
@@ -794,7 +809,7 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
         title_tokens=title_tokens,
         keywords=keywords,
         keyword_set=set(keywords),
-        skills_canonical=resolve_cv_skills(cv.cached_skills_canonical, lambda: find_skills(text)),
+        skills_canonical=resolve_cv_skills(cv.cached_skills_canonical, lambda: find_skills(text)) - LANGUAGE_CANONICALS,
         experience_years=experience_years,
         education_text=education_text,
         language_terms=language_terms,

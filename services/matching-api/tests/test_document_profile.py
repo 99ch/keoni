@@ -292,3 +292,11 @@ def test_empty_text_returns_an_empty_profile():
     assert profile.contract_type is None
     assert profile.language_terms == []
     assert profile.education_text == ""
+
+
+def test_job_experience_requirement_is_read_from_the_offer_text():
+    # prepare_job() s'en sert quand le champ WordPress "expérience" est vide :
+    # une offre qui écrit "minimum 7 années d'expérience" dans son texte doit
+    # avoir un signal d'expérience (composante sinon exclue du score).
+    text = "DevSecOps\nExpérience nécessaire : minimum 7 années d’expérience\nMéthodologie : Agile"
+    assert build_document_profile(text).experience_years == 7

@@ -53,7 +53,7 @@ import threading
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, FrozenSet, List, Optional, Sequence, Tuple, Union
+from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Tuple, Union
 
 from app.document_profile import _fold as _document_fold
 from app.taxonomy import find_skills, normalize_skill
@@ -233,6 +233,9 @@ class PreparedJob:
     education_text: str = ""
     language_terms: List[str] = field(default_factory=list)
     contract_type: Optional[str] = None
+    # Poids de chaque compétence requise dans la couverture (voir
+    # build_skill_weights). Vide = toutes à 1.0, comportement historique.
+    skill_weights: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -673,6 +676,38 @@ def core_keyword_coverage(
 # chuter le score à pleine pondération au lieu de ne simplement pas compter.
 
 
+# Poids d'une compétence requise dans la couverture. Une compétence du TITRE de
+# l'offre est son sujet même ("DevSecOps" pour une offre DevSecOps) ; une
+# compétence à faible pouvoir discriminant (WEAK_SKILL_CANONICALS : Cycle,
+# Compliance, Agile...) est citée dans presque tout CV IT. Sans ces poids, "Cycle"
+# valait autant que "DevSecOps" : le premier d'un classement avait 16 des 21
+# compétences requises sans avoir DevSecOps, Python ni OpenShift.
+EMPHASIZED_SKILL_WEIGHT = 3.0
+WEAK_SKILL_WEIGHT = 0.25
+
+
+def build_skill_weights(
+    skills: Iterable[str],
+    title_skills: Iterable[str],
+    weak_skills: Iterable[str],
+) -> dict[str, float]:
+    """Poids de chaque compétence requise : 3.0 si elle figure dans le titre de
+    l'offre, sinon 0.25 si elle est à faible pouvoir discriminant, sinon 1.0.
+    Une compétence faible dans le titre reste à 3.0 (une offre « Product
+    Owner » doit pouvoir l'exiger)."""
+    title = set(title_skills)
+    weak = set(weak_skills)
+    weights: dict[str, float] = {}
+    for skill in skills:
+        if skill in title:
+            weights[skill] = EMPHASIZED_SKILL_WEIGHT
+        elif skill in weak:
+            weights[skill] = WEAK_SKILL_WEIGHT
+        else:
+            weights[skill] = 1.0
+    return weights
+
+
 def skills_component(
     job: PreparedJob,
     cv_skills: FrozenSet[str],
@@ -700,11 +735,27 @@ def skills_component(
 
     matched = job.skills_canonical & cv_skills
     unmatched = job.skills_canonical - matched
-    credit = float(len(matched))
-    if unmatched and semantic_credit_fn is not None:
-        credit += semantic_credit_fn(frozenset(unmatched), frozenset(cv_skills))
 
-    coverage = credit / len(job.skills_canonical)
+    if not job.skill_weights:
+        # Historique : toutes les compétences requises pèsent 1.
+        credit = float(len(matched))
+        if unmatched and semantic_credit_fn is not None:
+            credit += semantic_credit_fn(frozenset(unmatched), frozenset(cv_skills))
+        coverage = credit / len(job.skills_canonical)
+        return min(1.0, coverage), True, sorted(matched)
+
+    def weight(skill: str) -> float:
+        return job.skill_weights.get(skill, 1.0)
+
+    total_weight = sum(weight(s) for s in job.skills_canonical)
+    credit = sum(weight(s) for s in matched)
+    if unmatched and semantic_credit_fn is not None:
+        # Le crédit sémantique est calculé compétence par compétence pour être
+        # pondéré comme elle (la fonction renvoie la somme de ses crédits).
+        for skill in unmatched:
+            credit += weight(skill) * semantic_credit_fn(frozenset({skill}), frozenset(cv_skills))
+
+    coverage = credit / total_weight if total_weight > 0 else 0.0
     return min(1.0, coverage), True, sorted(matched)
 
 

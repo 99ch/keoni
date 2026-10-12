@@ -2898,6 +2898,46 @@ SOFT_SKILL_CANONICALS: frozenset[str] = frozenset({
 # _GENERIC_SKILL_CANONICALS côté AI Real-Time (a4f576f/61886a9), plus
 # "Grande distribution" -- un ajout à nous, absent de leur liste (voir
 # son propre commentaire ci-dessous pour le cas réel qui l'a motivé).
+# Noms de langues détectés comme "compétences" par le référentiel ROME. Ils
+# sont déjà évalués par la composante "langues" (offre : langues requises,
+# CV : langues trouvées) : les compter aussi comme compétence donnait une
+# couverture gratuite à tout CV écrit en français (une offre qui dit
+# "Langues : Français" gagnait une "compétence requise" que tout le monde a).
+LANGUAGE_CANONICALS: frozenset[str] = frozenset({
+    "Français",
+    "Espagnol",
+    "Allemand",
+    "Arabe",
+    "Italien",
+    "Portugais",
+    "Chinois",
+    "Néerlandais",
+    "Russe",
+    "Japonais",
+})
+
+# Compétences à FAIBLE pouvoir discriminant : des concepts de process ou
+# d'organisation cités dans presque toute offre et presque tout CV IT, qui ne
+# distinguent pas un profil d'un autre. Constaté en production le 2026-10-12 :
+# pour une offre DevSecOps, 8 des 16 "compétences alignées" du candidat classé
+# premier étaient de cette nature (Cycle, Compliance, Product Owner, SGBD,
+# Scrum, Agile, Systèmes d'exploitation...) alors qu'il n'avait ni DevSecOps ni
+# Python ni OpenShift -- chaque terme valait autant que "DevSecOps" lui-même.
+# Elles ne sont PAS retirées (une offre "Product Owner" doit toujours pouvoir
+# les exiger) : elles pèsent WEAK_SKILL_WEIGHT au lieu de 1, sauf quand elles
+# figurent dans le titre de l'offre (voir scoring.build_skill_weights).
+WEAK_SKILL_CANONICALS: frozenset[str] = frozenset({
+    "Cycle",
+    "Compliance",
+    "Parties prenantes",
+    "Systèmes d’exploitation",
+    "SGBD",
+    "Architecture",
+    "Agile",
+    "Scrum",
+    "Product Owner",
+})
+
 _GENERIC_SKILL_CANONICALS: frozenset[str] = frozenset({
     "Communication",
     "Service client",
@@ -2928,7 +2968,11 @@ _GENERIC_SKILL_CANONICALS: frozenset[str] = frozenset({
 # Ensemble complet exclu du calcul de couverture technique (les deux
 # raisons sont distinctes -- trait comportemental vs vocabulaire générique
 # -- mais le traitement dans find_skills() est identique).
-_EXCLUDED_FROM_HARD_SKILLS: frozenset[str] = SOFT_SKILL_CANONICALS | _GENERIC_SKILL_CANONICALS
+# Les noms de langues sont détectés mais jamais renvoyés comme compétence (voir
+# LANGUAGE_CANONICALS) : la composante "langues" les évalue.
+_EXCLUDED_FROM_HARD_SKILLS: frozenset[str] = (
+    SOFT_SKILL_CANONICALS | _GENERIC_SKILL_CANONICALS | LANGUAGE_CANONICALS
+)
 
 
 @lru_cache(maxsize=1)

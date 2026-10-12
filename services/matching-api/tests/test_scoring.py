@@ -6,6 +6,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.scoring import (  # noqa: E402
+    EMPHASIZED_SKILL_WEIGHT,
+    WEAK_SKILL_WEIGHT,
+    build_skill_weights,
     active_priority_keyword_terms,
     CV_CHUNK_LIMIT,
     DEFAULT_WEIGHTS,
@@ -756,3 +759,55 @@ def test_job_without_priority_keywords_leaves_the_keywords_component_out_of_the_
     result = compute_final_score(job, cv, similarity=0.5, rerank_score=None)
     assert "keywords" in result.low_confidence_components
     assert result.core_keyword_coverage == 1.0
+
+
+# ── Poids des compétences requises (2026-10-12) ───────────────────────────────
+
+
+def test_skill_weights_emphasize_title_skills_and_downweight_weak_ones():
+    weights = build_skill_weights(
+        skills={"DevSecOps", "Python", "Cycle", "Agile"},
+        title_skills={"DevSecOps"},
+        weak_skills={"Cycle", "Agile"},
+    )
+    assert weights == {
+        "DevSecOps": EMPHASIZED_SKILL_WEIGHT,
+        "Python": 1.0,
+        "Cycle": WEAK_SKILL_WEIGHT,
+        "Agile": WEAK_SKILL_WEIGHT,
+    }
+
+
+def test_a_weak_skill_in_the_title_keeps_full_emphasis():
+    # Une offre "Product Owner" doit pouvoir exiger "Product Owner".
+    weights = build_skill_weights({"Product Owner", "Scrum"}, {"Product Owner"}, {"Product Owner", "Scrum"})
+    assert weights["Product Owner"] == EMPHASIZED_SKILL_WEIGHT
+    assert weights["Scrum"] == WEAK_SKILL_WEIGHT
+
+
+def test_without_weights_the_coverage_is_unchanged():
+    job = make_job(skills_canonical={"Python", "SQL"})
+    value, ok, _hits = skills_component(job, frozenset({"Python"}))
+    assert ok is True and value == 0.5
+
+
+def test_generic_skills_no_longer_outweigh_the_offer_s_core_skill():
+    # Cas réel du 2026-10-12 (offre DevSecOps) : un profil qui "aligne" beaucoup
+    # de termes génériques mais n'a pas la compétence du titre ne doit plus
+    # passer devant le profil qui l'a.
+    required = {"DevSecOps", "CI/CD", "Python", "Java", "SQL", "Linux", "OpenShift",
+                "Cycle", "Compliance", "Parties prenantes", "Product Owner", "Scrum", "Agile", "SGBD"}
+    weak = {"Cycle", "Compliance", "Parties prenantes", "Product Owner", "Scrum", "Agile", "SGBD"}
+    job = make_job(
+        skills_canonical=set(required),
+        skill_weights=build_skill_weights(required, {"DevSecOps"}, weak),
+    )
+    generalist = frozenset({"CI/CD", "Java", "SQL", "Linux", "Cycle", "Compliance",
+                            "Parties prenantes", "Product Owner", "Scrum", "Agile", "SGBD"})
+    specialist = frozenset({"DevSecOps", "CI/CD", "Python", "Java", "Linux", "OpenShift", "Agile"})
+
+    generalist_value, _, _ = skills_component(job, generalist)
+    specialist_value, _, _ = skills_component(job, specialist)
+
+    assert specialist_value > generalist_value
+
