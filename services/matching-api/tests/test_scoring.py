@@ -701,25 +701,20 @@ def test_cv_skills_are_recomputed_when_nothing_is_stored(cached):
 
 
 def test_result_selection_keeps_the_first_top_n():
-    channels = ["similar"] * 6
-    assert select_result_indices(channels, 3) == [0, 1, 2]
+    assert select_result_indices(6, 3) == [0, 1, 2]
 
 
-def test_result_selection_always_keeps_title_candidates_even_when_low_ranked():
-    # Le canal "titre" a sa propre section côté keoni-bridge : un candidat dont
-    # l'intitulé correspond à l'offre ne doit pas disparaître parce que son
-    # score est modeste.
-    channels = ["similar", "similar", "similar", "similar", "title", "similar"]
-    assert select_result_indices(channels, 2) == [0, 1, 4]
+def test_result_selection_keeps_everyone_when_top_n_exceeds_the_ranking():
+    assert select_result_indices(4, 300) == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize("top_n", [0, -5])
 def test_result_selection_has_no_cap_when_top_n_is_not_positive(top_n):
-    assert select_result_indices(["similar", "title", None], top_n) == [0, 1, 2]
+    assert select_result_indices(3, top_n) == [0, 1, 2]
 
 
 def test_result_selection_handles_an_empty_ranking():
-    assert select_result_indices([], 300) == []
+    assert select_result_indices(0, 300) == []
 
 
 def test_priority_keywords_are_ignored_when_disabled_even_if_filled():

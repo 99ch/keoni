@@ -102,9 +102,8 @@ class Settings:
     # n'aboutissait (constaté en prod, 2026-10-12). 0 = pas de relecture.
     crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "100"))
     # Nombre de résultats détaillés et renvoyés/écrits dans WordPress par
-    # offre, les meilleurs d'abord (plus tous les candidats du canal "titre",
-    # voir select_result_indices). TOUS les CV sont évalués et classés ; seuls
-    # ceux-là reçoivent le détail (extraits, forces/faiblesses) et sont
+    # offre, les meilleurs d'abord (voir select_result_indices). TOUS les CV
+    # sont évalués et classés ; seuls ceux-là reçoivent le détail (extraits, forces/faiblesses) et sont
     # envoyés. Sans plafond (2026-10-07 -> 2026-10-12), une offre renvoyait
     # ~30 000 résultats en une seule requête de 60 s après avoir purgé les
     # anciens -- ni exploitable à l'écran ni fiable. 0 = aucun plafond.
@@ -2651,30 +2650,13 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # -- décision explicite 2026-10-02. Email absent/vide : pas de
     # regroupement possible, chaque fiche reste indépendante (clé par
     # cv_id) plutôt que risquer de fusionner des candidats différents.
-    # Garder la fiche la mieux notée peut faire perdre l'étiquette "titre"
-    # sans ce correctif : si la fiche qui a matché par titre strict n'est
-    # pas celle qui score le mieux pour cette personne, le dédoublonnage
-    # ci-dessus gardait silencieusement une autre fiche "similar" à sa
-    # place, et plus aucun résultat final n'était marqué "titre" pour
-    # cette offre (constaté en prod : 0/104 -- les 20 fiches "titre"
-    # existaient bien en amont, mais aucune n'était la mieux notée de sa
-    # personne). On retient toujours la fiche la mieux notée par email,
-    # mais si CETTE personne a ne serait-ce qu'une fiche "titre" ailleurs
-    # dans le lot, l'étiquette est reportée sur la fiche conservée.
     email_by_cv_id = {cv.payload.id: (cv.payload.candidate_email or "").strip().lower() for cv, _ in ranked}
     best_by_candidate: dict[str, ScoreItem] = {}
-    title_seen: set[str] = set()
     for item in scored_items:
         key = email_by_cv_id.get(item.cv_id) or f"cv:{item.cv_id}"
-        if item.extra.get("retrieval_channel") == "title":
-            title_seen.add(key)
         current = best_by_candidate.get(key)
         if current is None or item.score > current.score:
             best_by_candidate[key] = item
-    for key in title_seen:
-        kept = best_by_candidate.get(key)
-        if kept is not None:
-            kept.extra["retrieval_channel"] = "title"
     scored_items = list(best_by_candidate.values())
 
     # Final deterministic ranking must follow final score, not raw embedding rank.
@@ -2687,23 +2669,18 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
         )
     )
 
-    # Seuls les meilleurs résultats (plus le canal "titre") reçoivent le
-    # détail et sont renvoyés -- voir Settings.results_top_n. Tous les CV ont
-    # été évalués et classés ci-dessus ; le score détaillé est recalculé à
+    # Seuls les meilleurs résultats, strictement par score, reçoivent le détail
+    # et sont renvoyés -- voir Settings.results_top_n. Tous les CV ont été
+    # évalués et classés ci-dessus ; le score détaillé est recalculé à
     # l'identique (mêmes entrées, y compris le score cross-encoder).
-    kept_positions = select_result_indices(
-        [item.extra.get("retrieval_channel") for item in scored_items], settings.results_top_n
-    )
+    kept_positions = select_result_indices(len(scored_items), settings.results_top_n)
     index_by_cv_id = {cv.payload.id: i for i, (cv, _sim) in enumerate(ranked)}
     detailed_items: List[ScoreItem] = []
     for position in kept_positions:
         light = scored_items[position]
         i = index_by_cv_id[light.cv_id]
         cv, sim = ranked[i]
-        full = build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id), detailed=True)
-        # Étiquette "titre" éventuellement reportée par le dédoublonnage.
-        full.extra["retrieval_channel"] = light.extra.get("retrieval_channel")
-        detailed_items.append(full)
+        detailed_items.append(build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id), detailed=True))
     scored_items = detailed_items
 
     for final_rank, item in enumerate(scored_items, start=1):

@@ -187,16 +187,13 @@ def select_rerank_shortlist(scores: Sequence[float], top_k: int) -> list[int]:
     return sorted(range(len(scores)), key=lambda i: (-scores[i], i))[:limit]
 
 
-def select_result_indices(channels: Sequence[Optional[str]], top_n: int) -> list[int]:
-    """Positions à garder dans un classement DÉJÀ trié (meilleur d'abord) :
-    les `top_n` premiers, plus TOUS les candidats du canal "titre"
-    (correspondance stricte de titre, section dédiée côté keoni-bridge) même
-    s'ils sont plus bas -- ils ne doivent jamais disparaître d'une offre
-    parce que leur score est modeste. `top_n` <= 0 : aucun plafond, tout est
-    gardé."""
+def select_result_indices(total: int, top_n: int) -> list[int]:
+    """Positions à garder dans un classement DÉJÀ trié (meilleur d'abord) : les
+    `top_n` premières, strictement par score. `top_n` <= 0 : aucun plafond, tout
+    est gardé."""
     if top_n <= 0:
-        return list(range(len(channels)))
-    return [i for i, channel in enumerate(channels) if i < top_n or channel == "title"]
+        return list(range(total))
+    return list(range(min(total, top_n)))
 
 
 def resolve_cv_skills(cached: Optional[Sequence[str]], compute: Callable[[], Sequence[str]]) -> set[str]:
