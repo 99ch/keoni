@@ -688,7 +688,15 @@ def skills_component(
     if not job.skills_canonical:
         return 0.5, False, []  # offre sans compétence identifiable à comparer
     if not cv_skills:
-        return 0.0, False, []  # rien d'extrait côté CV pour comparer
+        # Aucune compétence détectée dans le CV alors que l'offre en exige :
+        # couverture NULLE, avec signal. Ne pas l'exclure du calcul : un CV
+        # dont le texte est absent, illisible (police PDF mal décodée) ou
+        # tronqué recevrait sinon la seule composante sémantique (~0.73 pour
+        # presque tout le monde) et passerait devant des profils pertinents à
+        # couverture partielle -- constaté en production le 2026-10-12, où ~40
+        # CV mal extraits occupaient le haut de chaque classement. Le plafond
+        # de couverture (SKILL_CAP_FLOOR) s'applique alors : score <= 30.
+        return 0.0, True, []
 
     matched = job.skills_canonical & cv_skills
     unmatched = job.skills_canonical - matched

@@ -87,10 +87,32 @@ def test_skills_component_no_signal_when_job_has_no_skills():
     assert (value, ok, hits) == (0.5, False, [])
 
 
-def test_skills_component_no_signal_when_cv_has_no_skills():
+def test_skills_component_counts_zero_coverage_when_cv_has_no_skills():
+    # Pas de signal != bonne nouvelle : un CV sans aucune compétence détectée
+    # (texte illisible ou tronqué) a une couverture nulle, avec signal.
     job = make_job(skills_canonical={"Python"})
     value, ok, hits = skills_component(job, frozenset())
-    assert (value, ok, hits) == (0.0, False, [])
+    assert (value, ok, hits) == (0.0, True, [])
+
+
+def test_cv_without_detected_skills_never_outranks_a_partial_match():
+    job = make_job(skills_canonical={"Python", "SQL", "Docker", "Linux"})
+    unreadable = make_cv(skills_canonical=set())
+    partial = make_cv(skills_canonical={"Python", "SQL"})
+
+    low = compute_final_score(job, unreadable, similarity=0.73, rerank_score=None)
+    mid = compute_final_score(job, partial, similarity=0.73, rerank_score=None)
+
+    assert low.score <= 30.0
+    assert mid.score > low.score
+
+
+def test_cv_without_detected_skills_is_still_capped_without_any_job_skill_list():
+    # Offre sans compétence identifiable : rien à comparer, aucun plafond.
+    job = make_job(skills_canonical=set())
+    cv = make_cv(skills_canonical=set())
+    result = compute_final_score(job, cv, similarity=0.73, rerank_score=None)
+    assert result.score > 30.0
 
 
 def test_skills_component_partial_coverage():

@@ -2118,6 +2118,11 @@ def build_score(
             weaknesses.append(f"Mots-clés prioritaires manquants : {', '.join(result.keyword_missing)}.")
 
     if job.skills_canonical:
+        if not cv.skills_canonical:
+            weaknesses.append(
+                "Aucune compétence détectée dans le CV : texte absent, illisible ou incomplet. "
+                "Score plafonné -- à vérifier manuellement."
+            )
         if result.skill_hits:
             strengths.append(f"Compétences requises alignées : {', '.join(result.skill_hits)}.")
         else:
