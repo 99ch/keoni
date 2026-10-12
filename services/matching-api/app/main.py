@@ -51,7 +51,7 @@ from app.scoring import (
     select_result_indices,
     strip_html,
     set_skill_embedding_tuning,
-    split_priority_keyword_terms,
+    active_priority_keyword_terms,
     tokenize,
     weights_for_profile,
 )
@@ -109,6 +109,12 @@ class Settings:
     # ~30 000 résultats en une seule requête de 60 s après avoir purgé les
     # anciens -- ni exploitable à l'écran ni fiable. 0 = aucun plafond.
     results_top_n: int = int(os.getenv("MATCHING_RESULTS_TOP_N", "300"))
+    # Mots-clés prioritaires du recruteur (champ WP "Méta Mots-clés") dans le
+    # score : désactivé par défaut -- toute offre est alors traitée comme sans
+    # mots-clés prioritaires, même si le champ est rempli (composante exclue de
+    # la moyenne, plus de pénalité "core keyword"). Le champ reste lu pour le
+    # texte de l'offre (embedding/compétences détectées). "1" pour réactiver.
+    priority_keywords_enabled: bool = os.getenv("MATCHING_PRIORITY_KEYWORDS_ENABLED", "0") == "1"
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -732,7 +738,7 @@ def prepare_job(job: JobPayload) -> PreparedJob:
     # plus retomber sur meta.skills (champ WP `prefferdskills`,
     # "Compétences") : les deux champs ont des usages distincts côté
     # recruteur, "Compétences" n'est plus utilisé par le scoring du tout.
-    keyword_terms_raw = split_priority_keyword_terms(job.keywords)
+    keyword_terms_raw = active_priority_keyword_terms(job.keywords, settings.priority_keywords_enabled)
     scoring_profile = job.scoring_profile or normalized_text(find_first(meta, ["scoring_profile", "profil_scoring"])) or None
 
     return PreparedJob(

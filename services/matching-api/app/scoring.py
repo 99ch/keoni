@@ -499,6 +499,17 @@ def split_priority_keyword_terms(raw: Optional[Union[str, Sequence[str]]]) -> Li
     return terms
 
 
+def active_priority_keyword_terms(raw: Optional[Union[str, Sequence[str]]], enabled: bool) -> List[str]:
+    """Mots-clés prioritaires réellement pris en compte pour une offre. `enabled`
+    faux (MATCHING_PRIORITY_KEYWORDS_ENABLED, défaut) : toujours vide, même si
+    le recruteur a rempli le champ -- l'offre est alors traitée comme une offre
+    SANS mots-clés prioritaires (composante exclue de la moyenne, aucune
+    pénalité "core keyword", voir priority_keyword_component et
+    core_keyword_coverage), les poids se répartissent sur les autres
+    composantes."""
+    return split_priority_keyword_terms(raw) if enabled else []
+
+
 def normalize_priority_keyword(raw_term: str) -> Optional[str]:
     """normalize_skill(), étendu pour l'abréviation recruteur combinant deux
     synonymes sur une ligne avec un "/" ("MOA / AMOA"). Portage à

@@ -6,6 +6,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.scoring import (  # noqa: E402
+    active_priority_keyword_terms,
     CV_CHUNK_LIMIT,
     DEFAULT_WEIGHTS,
     JOB_CHUNK_LIMIT,
@@ -719,3 +720,22 @@ def test_result_selection_has_no_cap_when_top_n_is_not_positive(top_n):
 
 def test_result_selection_handles_an_empty_ranking():
     assert select_result_indices([], 300) == []
+
+
+def test_priority_keywords_are_ignored_when_disabled_even_if_filled():
+    assert active_priority_keyword_terms("Python, SQL, Docker", enabled=False) == []
+    assert active_priority_keyword_terms(["Python", "SQL"], enabled=False) == []
+
+
+def test_priority_keywords_are_read_when_enabled():
+    assert active_priority_keyword_terms("Python, SQL", enabled=True) == ["Python", "SQL"]
+
+
+def test_job_without_priority_keywords_leaves_the_keywords_component_out_of_the_score():
+    # Offre dont les mots-clés sont ignorés (liste vide) : la composante est
+    # marquée sans signal et exclue de la moyenne, pas comptée comme zéro.
+    job = make_job(keyword_terms_raw=active_priority_keyword_terms("Python, SQL", enabled=False))
+    cv = make_cv(skills_canonical={"python", "sql"})
+    result = compute_final_score(job, cv, similarity=0.5, rerank_score=None)
+    assert "keywords" in result.low_confidence_components
+    assert result.core_keyword_coverage == 1.0
