@@ -236,3 +236,36 @@ def test_image_coverage_measures_how_much_of_the_page_is_an_image():
     pix.set_rect(pix.irect, (200, 200, 200))
     page.insert_image(fitz.Rect(0, 0, 600, 800), pixmap=pix)
     assert _image_coverage(page) >= 0.9
+
+
+# ── Tesseract limité à un thread (saturation du serveur en OCR parallèle) ─────
+#
+# Mesuré en production (VPS 4 cœurs) : 8 OCR en parallèle avec les threads par
+# défaut de Tesseract (OpenMP) portaient la charge à 32 et dépassaient tous le
+# délai de 25 s par page -- les CV illisibles restaient illisibles --, alors que
+# le même lot passait en 2,4 s avec OMP_THREAD_LIMIT=1.
+
+def test_single_thread_wrapper_is_used_when_installed(monkeypatch):
+    from app import extraction
+
+    monkeypatch.setattr(extraction.shutil, "which", lambda name: "/usr/local/bin/tesseract-1t" if name == "tesseract-1t" else None)
+    assert extraction.single_thread_tesseract_cmd() == "/usr/local/bin/tesseract-1t"
+
+
+def test_no_wrapper_leaves_tesseract_untouched(monkeypatch):
+    from app import extraction
+
+    monkeypatch.setattr(extraction.shutil, "which", lambda name: None)
+    assert extraction.single_thread_tesseract_cmd() is None
+
+
+def test_dockerfile_installs_the_wrapper_and_does_not_limit_threads_globally():
+    from pathlib import Path
+
+    dockerfile = Path(__file__).resolve().parents[1].joinpath("Dockerfile").read_text(encoding="utf-8")
+    assert "tesseract-1t" in dockerfile
+    assert "OMP_THREAD_LIMIT=1" in dockerfile
+    # jamais en ENV : cela limiterait aussi PyTorch (embeddings, cross-encoder)
+    assert not any(
+        line.strip().startswith("ENV") and "OMP_THREAD_LIMIT" in line for line in dockerfile.splitlines()
+    )

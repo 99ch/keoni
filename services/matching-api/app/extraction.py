@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import unicodedata
 from pathlib import Path
 
@@ -40,6 +41,23 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pdf2image import convert_from_path
+
+
+def single_thread_tesseract_cmd() -> str | None:
+    """Chemin du script d'enrobage qui lance Tesseract avec OMP_THREAD_LIMIT=1
+    (voir le Dockerfile), ou None s'il n'est pas installé (poste de dev).
+
+    Tesseract est multi-thread : la réindexation en lance plusieurs en parallèle
+    et, sans limite, 8 OCR simultanés sur 4 cœurs saturaient le serveur au point
+    de dépasser le délai par page (mesuré : lot de 8 pages en 2,4 s à un thread
+    chacun, sans fin visible sinon). Posée sur Tesseract seul, la limite
+    n'affecte pas PyTorch, contrairement à une variable d'environnement globale."""
+    return shutil.which("tesseract-1t")
+
+
+_TESSERACT_WRAPPER = single_thread_tesseract_cmd()
+if _TESSERACT_WRAPPER:
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_WRAPPER
 
 logger = logging.getLogger(__name__)
 
