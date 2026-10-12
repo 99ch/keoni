@@ -46,6 +46,7 @@ from app.scoring import (
     compute_final_score,
     get_skill_embedding_tuning,
     normalize_whitespace,
+    resolve_cv_skills,
     select_rerank_shortlist,
     strip_html,
     set_skill_embedding_tuning,
@@ -379,6 +380,10 @@ class CvPayload(BaseModel):
     cached_contract_type: Optional[str] = None
     cached_education_text: Optional[str] = None
     cached_language_terms: Optional[List[str]] = None
+    # Compétences trouvées à l'indexation (CvEmbedding.skills_canonical) --
+    # même principe : prepare_cv() évite de relire tout le texte du CV avec
+    # find_skills() à chaque scoring (voir resolve_cv_skills).
+    cached_skills_canonical: Optional[List[str]] = None
     # "title" (correspondance stricte de titre, ex-L1 n8n) ou "similar"
     # (retenu par le canal sémantique/taxonomie uniquement) -- injecté par
     # retrieve() (voir son commentaire), jamais fourni par un appelant.
@@ -663,6 +668,7 @@ def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, dict]:
             CvEmbedding.contract_type,
             CvEmbedding.education_text,
             CvEmbedding.language_terms,
+            CvEmbedding.skills_canonical,
         ).where(CvEmbedding.cv_id.in_(cv_ids))
     ).all()
     return {
@@ -672,6 +678,7 @@ def fetch_cached_cv_text(conn, cv_ids: Sequence[int]) -> Dict[int, dict]:
             "contract_type": row.contract_type,
             "education_text": row.education_text,
             "language_terms": row.language_terms,
+            "skills_canonical": row.skills_canonical,
         }
         for row in rows
         if row.text_content
@@ -773,7 +780,7 @@ def prepare_cv(cv: CvPayload) -> PreparedCv:
         title_tokens=title_tokens,
         keywords=keywords,
         keyword_set=set(keywords),
-        skills_canonical=set(find_skills(text)),
+        skills_canonical=resolve_cv_skills(cv.cached_skills_canonical, lambda: find_skills(text)),
         experience_years=experience_years,
         education_text=education_text,
         language_terms=language_terms,
@@ -1040,6 +1047,7 @@ def resume_to_cv_payload(resume: dict) -> "CvPayload":
         cached_contract_type=resume.get("cached_contract_type") or None,
         cached_education_text=resume.get("cached_education_text") or None,
         cached_language_terms=resume.get("cached_language_terms") or None,
+        cached_skills_canonical=resume.get("cached_skills_canonical") or None,
         retrieval_channel=resume.get("retrieval_channel") or None,
         keywords=resume.get("keywords"),
         metadata=metadata if isinstance(metadata, dict) else None,
@@ -2487,6 +2495,7 @@ def retrieve(payload: RetrieveRequest, _: None = Depends(require_api_key)) -> di
             cv["cached_contract_type"] = cached["contract_type"]
             cv["cached_education_text"] = cached["education_text"]
             cv["cached_language_terms"] = cached["language_terms"]
+            cv["cached_skills_canonical"] = cached["skills_canonical"]
         cv["retrieval_channel"] = channel_by_id.get(cv_id, "similar")
 
     return {

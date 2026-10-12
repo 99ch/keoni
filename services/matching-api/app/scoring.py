@@ -187,6 +187,18 @@ def select_rerank_shortlist(scores: Sequence[float], top_k: int) -> list[int]:
     return sorted(range(len(scores)), key=lambda i: (-scores[i], i))[:limit]
 
 
+def resolve_cv_skills(cached: Optional[Sequence[str]], compute: Callable[[], Sequence[str]]) -> set[str]:
+    """Compétences d'un CV : celles déjà enregistrées à l'indexation
+    (cv_embeddings.skills_canonical, calculées par find_skills sur le même
+    texte) si elles existent, sinon `compute()` -- un CV pas encore indexé, ou
+    dont aucune compétence n'a été trouvée (liste vide : indistinguable d'une
+    colonne jamais remplie, on recalcule par prudence). Évite de relire le
+    texte entier de chaque CV du vivier à chaque scoring."""
+    if cached:
+        return set(cached)
+    return set(compute())
+
+
 @dataclass(slots=True)
 class PreparedJob:
     text: str

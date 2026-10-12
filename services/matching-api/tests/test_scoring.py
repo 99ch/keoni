@@ -27,6 +27,7 @@ from app.scoring import (  # noqa: E402
     normalize_priority_keyword,
     normalize_whitespace,
     priority_keyword_component,
+    resolve_cv_skills,
     resolve_priority_keywords,
     select_rerank_shortlist,
     set_skill_embedding_tuning,
@@ -676,3 +677,22 @@ def test_rerank_shortlist_is_empty_when_top_k_is_not_positive(top_k):
 
 def test_rerank_shortlist_handles_no_candidates():
     assert select_rerank_shortlist([], 100) == []
+
+
+def test_cv_skills_use_the_stored_ones_without_recomputing():
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return ["recalcule"]
+
+    assert resolve_cv_skills(["python", "sql"], compute) == {"python", "sql"}
+    assert calls == []
+
+
+@pytest.mark.parametrize("cached", [None, []])
+def test_cv_skills_are_recomputed_when_nothing_is_stored(cached):
+    # None = CV pas encore indexé ; [] = indistinguable d'une colonne jamais
+    # remplie -- dans les deux cas on recalcule plutôt que de croire "aucune
+    # compétence".
+    assert resolve_cv_skills(cached, lambda: ["python"]) == {"python"}
