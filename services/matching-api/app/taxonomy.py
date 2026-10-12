@@ -2552,6 +2552,22 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Siebel": ["siebel", "oracle siebel"],
     "Cacti": ["cacti"],
 
+    # ── AJOUTS 2026-10-12 (lot 7) -- audit de ~25 offres d'emploi reelles
+    # (secteurs infra/DevOps/cloud, data/IA, securite, assurance) -- portes
+    # a l'identique cote AI Real-Time. La plupart des outils cites dans ces
+    # offres etaient deja couverts (OpenShift, Kubernetes, ArgoCD, Tekton,
+    # Helm, Hive/HBase/Solr, Talend, ServiceNow, Selenium, Postman...),
+    # confirmant une bonne largeur de couverture deja en place. "LaTeX"
+    # ecarte deliberement malgre le signal (projet AMC OMR) : collision
+    # avec "latex" la matiere (gants medicaux/labo), signal pas assez
+    # generalisable au-dela d'un seul employeur.
+    "Kerberos": ["kerberos"],
+    "Azure Data Factory": ["azure data factory", "data factory"],
+    "Samba": ["samba"],
+    "GraphTalk": ["graphtalk", "graphtalk aia"],
+    "ITBM": ["itbm"],
+    "Clarity PPM": ["clarity ppm"],
+
     # ── AJOUTS PROPRES À KEONI (sans équivalent chez AI Real-Time) ─────────
     # jQuery a existé ici comme ajout Keoni jusqu'au portage de 2561ad5, qui
     # introduit "JQuery" (même alias "jquery") -- retiré pour éviter deux
