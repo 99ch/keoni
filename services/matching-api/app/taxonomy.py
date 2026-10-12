@@ -138,7 +138,7 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Tableau": ["tableau", "tableau software"],
     "SAP": ["sap", "sap erp", "sap hana", "sap r3", "sap r/3"],
     "Salesforce": ["salesforce", "sfdc", "crm salesforce"],
-    "Cybersécurité": ["cybersecurite", "cybersecurity", "securite informatique", "pentest", "securite reseau", "soc", "siem", "owasp", "csrf", "xss", "vulnerabilites", "vulnerabilite"],
+    "Cybersécurité": ["cybersecurite", "cybersecurity", "securite informatique", "pentest", "securite reseau", "soc", "siem", "owasp", "csrf", "xss", "vulnerabilites", "vulnerabilite", "test d'intrusion", "tests d'intrusion"],
     "ISO 27001": ["iso 27001", "iso27001", "norme iso 27001", "iec 27001", "iso/iec 27001"],
     "ISO 27005": ["iso 27005", "iso27005"],
     "ISO 42001": ["iso 42001", "iso42001"],
@@ -2517,7 +2517,7 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Merise": ["merise"],
     "IIS": ["iis"],
     "PuTTY": ["putty"],
-    "Microsoft Exchange": ["microsoft exchange"],
+    "Microsoft Exchange": ["microsoft exchange", "messagerie exchange"],
     "F5 Networks": ["f5 networks", "f5"],
     "DBeaver": ["dbeaver"],
     "HP-UX": ["hp-ux", "hpux"],
@@ -2567,6 +2567,24 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "GraphTalk": ["graphtalk", "graphtalk aia"],
     "ITBM": ["itbm"],
     "Clarity PPM": ["clarity ppm"],
+
+    # ── AJOUTS 2026-10-12 (lot 8) -- audit du classeur utilisateur
+    # competences_benin_digital.xlsx (246 competences detectees sur ~1020
+    # offres reelles, feuille "Competences") -- portes a l'identique cote
+    # AI Real-Time. La grande majorite des 246 entrees etait deja
+    # couverte ; les non-resolues etaient surtout des categories
+    # (secteurs, savoir-etre) ou des fragments de decoupage ("CI"/"CD"
+    # depuis "CI/CD", deja couvert en forme composee) plutot que de vrais
+    # termes manquants.
+    "Firewall": ["firewall"],
+    "Proxy": ["proxy"],
+    "Mainframe": ["mainframe"],
+    "OpenStack": ["openstack"],
+    "Jakarta EE": ["jakarta ee"],
+    "Microsoft Dynamics": ["microsoft dynamics", "dynamics 365", "dynamics crm"],
+    "Pega": ["pegasystems", "pega"],
+    "SAP S/4HANA": ["sap s/4hana", "s/4hana"],
+    "Tests de performance": ["tests de performance", "test de performance"],
 
     # ── AJOUTS PROPRES À KEONI (sans équivalent chez AI Real-Time) ─────────
     # jQuery a existé ici comme ajout Keoni jusqu'au portage de 2561ad5, qui
