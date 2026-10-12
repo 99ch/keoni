@@ -2457,6 +2457,43 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "Firebase": ["firebase"],
     "Material Design": ["material design"],
 
+    # ── AJOUTS 2026-10-12 (lot 5) -- échantillon de 3000 vrais CV
+    # (cv_embeddings.text_content), tiré après la réindexation complète des
+    # 33 573 CV sur Keoni -- portés à l'identique côté AI Real-Time. "Windows"
+    # bare gardé malgré sa fréquence capitalisée uniquement (regex sensible à
+    # la casse) : pas un mot français courant, contrairement à "eclipse"/
+    # "chef"/"sas" déjà exclus par ailleurs. "Toad"/"Mantis"/"ELK" gardés en
+    # forme composée ou vérifiés non-collisionnants avant tout alias nu.
+    "Microsoft Windows": ["windows"],
+    "Red Hat": ["red hat", "redhat"],
+    "Mantis Bug Tracker": ["mantis bug tracker", "mantis"],
+    "Miro": ["miro"],
+    "PL/SQL": ["pl/sql", "plsql"],
+    "DAX (Power BI)": ["dax"],
+    "Teradata": ["teradata"],
+    "Solaris": ["solaris"],
+    "Dataiku": ["dataiku"],
+    "CMMI": ["cmmi"],
+    "EIGRP": ["eigrp"],
+    "Zscaler": ["zscaler"],
+    "EasyVista": ["easyvista"],
+    "XSLT": ["xslt"],
+    "XSD": ["xsd"],
+    "XSL": ["xsl"],
+    "SQLite": ["sqlite"],
+    "Matplotlib": ["matplotlib"],
+    "FileZilla": ["filezilla"],
+    "HDFS": ["hdfs"],
+    "Centreon": ["centreon"],
+    "Toad (Oracle)": ["toad for oracle"],
+    "Visual Studio": ["visual studio"],
+    "Visual Studio Code": ["visual studio code"],
+    "Quality Center": ["quality center", "hp quality center"],
+    "Lotus Notes": ["lotus notes"],
+    "Skype": ["skype"],
+    "AS/400": ["as/400", "as400"],
+    "ELK Stack": ["elk stack", "elk"],
+
     # ── AJOUTS PROPRES À KEONI (sans équivalent chez AI Real-Time) ─────────
     # jQuery a existé ici comme ajout Keoni jusqu'au portage de 2561ad5, qui
     # introduit "JQuery" (même alias "jquery") -- retiré pour éviter deux
