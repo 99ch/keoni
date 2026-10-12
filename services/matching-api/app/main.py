@@ -2452,6 +2452,88 @@ def start_reindex_cvs(
     return ReindexStatus(**_reindex_status)
 
 
+def run_reindex_without_skills() -> None:
+    """Ré-extrait et réindexe les CV déjà indexés mais SANS aucune compétence
+    détectée (cv_embeddings.skills_canonical vide) -- en général un texte
+    illisible (police PDF mal décodée) ou incomplet (corps du CV en image), que
+    l'extraction corrigée (extraction.page_ocr_reason, OCR page par page) sait
+    maintenant relire. Vise ce petit groupe plutôt que tout le vivier : ~40 CV
+    sur ~32 750 suffisaient à polluer le haut de chaque classement.
+
+    Tourne DANS le moteur (pas dans un second processus : charger les modèles
+    une deuxième fois approcherait la limite mémoire du conteneur). Même état et
+    même verrou que la réindexation complète. Une passe incrémentale précède
+    toujours : réindexer ces CV fait avancer cv_embeddings.updated_at, repère de
+    la réindexation incrémentale -- les CV récents encore non indexés doivent
+    l'être avant, sinon ils ne seraient jamais repris."""
+    with _reindex_lock:
+        if _reindex_status["running"]:
+            return
+        _reindex_status.update(
+            running=True,
+            started_at=time.time(),
+            finished_at=None,
+            processed=0,
+            updated=0,
+            skipped=0,
+            errors=0,
+            total_seen=0,
+            last_error=None,
+        )
+
+    try:
+        reindex_modified_cvs()
+
+        engine = get_engine()
+        if engine is None:
+            raise RuntimeError("Base de données indisponible")
+        with engine.begin() as conn:
+            cv_ids = [
+                int(row.cv_id)
+                for row in conn.execute(
+                    select(CvEmbedding.cv_id)
+                    .where(func.cardinality(CvEmbedding.skills_canonical) == 0)
+                    .order_by(CvEmbedding.cv_id)
+                )
+            ]
+        _reindex_status["total_seen"] = len(cv_ids)
+
+        page_size = max(1, settings.reindex_page_size)
+        for start in range(0, len(cv_ids), page_size):
+            chunk = cv_ids[start : start + page_size]
+            try:
+                reindex_cv_batch(fetch_wp_resumes_by_ids(chunk))
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Réindexation des CV sans compétence: lot %s échoué: %s", start, exc)
+                _reindex_status["errors"] += 1
+                _reindex_status["last_error"] = str(exc)
+            _reindex_status["processed"] += len(chunk)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Réindexation des CV sans compétence échouée: %s", exc)
+        _reindex_status["errors"] += 1
+        _reindex_status["last_error"] = str(exc)
+    finally:
+        _reindex_status["running"] = False
+        _reindex_status["finished_at"] = time.time()
+
+
+@app.post("/admin/reindex-cvs/without-skills", response_model=ReindexStatus)
+def start_reindex_without_skills(
+    background_tasks: BackgroundTasks,
+    _: None = Depends(require_api_key),
+) -> ReindexStatus:
+    """Relance, en tâche de fond, l'extraction des seuls CV indexés sans aucune
+    compétence détectée (voir run_reindex_without_skills). Suivi par
+    /admin/reindex-cvs/status ; `total_seen` = nombre de CV visés."""
+    if not _pgvector_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Persistance pgvector indisponible")
+    if _reindex_status["running"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Une réindexation est déjà en cours")
+
+    background_tasks.add_task(run_reindex_without_skills)
+    return ReindexStatus(**_reindex_status)
+
+
 @app.get("/admin/reindex-cvs/status", response_model=ReindexStatus)
 def get_reindex_status(_: None = Depends(require_api_key)) -> ReindexStatus:
     return ReindexStatus(**_reindex_status)

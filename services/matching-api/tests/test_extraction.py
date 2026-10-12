@@ -28,9 +28,12 @@ from docx.oxml.ns import nsdecls
 from app.extraction import (
     _collapse_letter_spacing,
     _detect_column_gutter,
+    _image_coverage,
     _is_plausible_table,
     clean_text,
     extract_text_from_docx,
+    looks_unreadable,
+    page_ocr_reason,
 )
 
 
@@ -152,3 +155,84 @@ def test_docx_captures_text_hidden_in_a_textbox(tmp_path):
     assert "Pied de page visible normalement." in result
     assert "Compétences: Python, Django, PostgreSQL" in result
     assert "Expérience: 5 ans en développement backend" in result
+
+
+# ── Texte présent mais inexploitable / incomplet : l'OCR doit prendre le relais ──
+#
+# Constaté en production le 2026-10-12 sur deux CV qui n'avaient AUCUNE
+# compétence détectée et remontaient en tête de chaque classement : l'un avait
+# une police PDF sans table Unicode (texte décalé), l'autre un corps de CV rendu
+# en image avec seulement l'état civil en couche texte (928 caractères). Dans
+# les deux cas la page dépassait largement le seuil des « 20 caractères » : l'OCR
+# ne se déclenchait pas. Les chaînes ci-dessous ne contiennent aucune donnée
+# personnelle.
+
+GARBLED_FONT_TEXT = (
+    r"3\WKRQ64/DLQVLTX HQ JHVWLRQGHEDVHVGHGRQQ«HVJ«RJUDSKLTXHVFRPSOH[HVDYHF3RVW*,6RQH[S«ULHQFHPDSHUPLVG "
+    r"RSWLPLVHU O H[SORLWDWLRQGHVGRQQ«HVSRXUGHVSURMHWVDQDO\WLTXHVHQJDUDQWLVVDQWODTXDOLW«HWODILDELOLW«GHVLQIRUPDWLRQV"
+)
+
+NORMAL_FRENCH_TEXT = (
+    "Ingénieur DevOps avec huit ans d'expérience dans la mise en place de pipelines CI/CD et "
+    "l'automatisation des déploiements sur des environnements cloud. Responsable de la sécurité des "
+    "applications et de la formation des équipes de développement."
+)
+
+SKILLS_LIST_TEXT = (
+    "Python, SQL, Docker, Kubernetes, Terraform, Ansible, Jenkins, GitLab CI, Prometheus, Grafana, Linux, "
+    "Bash, Java, Spring Boot, PostgreSQL, Oracle, MongoDB, Redis, Kafka, RabbitMQ, OpenShift, Azure, AWS, "
+    "GCP, SonarQube, Nexus"
+)
+
+CIVIL_STATUS_TEXT = (
+    "Prénom Nom Né le 19/08/1994 Marocain, Célibataire 28 Rue Jbel Aouam Casablanca Maroc Permis B "
+    "Disponible immédiatement Mobilité nationale et internationale Langues Arabe Français Anglais"
+)
+
+
+def test_garbled_font_text_is_detected_as_unreadable():
+    assert looks_unreadable(GARBLED_FONT_TEXT) is True
+
+
+def test_readable_texts_are_not_flagged_as_unreadable():
+    assert looks_unreadable(NORMAL_FRENCH_TEXT) is False
+    # Une page faite d'une simple liste d'outils n'est pas du bruit.
+    assert looks_unreadable(SKILLS_LIST_TEXT) is False
+    assert looks_unreadable(CIVIL_STATUS_TEXT) is False
+
+
+def test_short_text_is_never_called_unreadable():
+    assert looks_unreadable("Python SQL") is False
+    assert looks_unreadable("") is False
+
+
+def test_page_ocr_reason_covers_the_three_cases():
+    assert page_ocr_reason("", 0.0) == "vide"
+    assert page_ocr_reason("quelques mots", 0.0) == "vide"
+    assert page_ocr_reason(GARBLED_FONT_TEXT, 0.0) == "illisible"
+    # Peu de texte sur une page presque entièrement occupée par une image.
+    assert page_ocr_reason(CIVIL_STATUS_TEXT, 0.8) == "incomplète"
+
+
+def test_page_ocr_reason_leaves_a_normal_text_page_alone():
+    assert page_ocr_reason(NORMAL_FRENCH_TEXT, 0.0) is None
+    # Une petite photo d'identité sur une page bien remplie ne déclenche rien.
+    assert page_ocr_reason(NORMAL_FRENCH_TEXT * 12, 0.1) is None
+    # Une grande image mais un texte abondant : le texte suffit.
+    assert page_ocr_reason(NORMAL_FRENCH_TEXT * 12, 0.8) is None
+
+
+def test_image_coverage_measures_how_much_of_the_page_is_an_image():
+    import fitz
+
+    text_only = fitz.open()
+    page = text_only.new_page(width=600, height=800)
+    page.insert_text((50, 100), "Texte seul")
+    assert _image_coverage(page) == 0.0
+
+    with_image = fitz.open()
+    page = with_image.new_page(width=600, height=800)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 100), False)
+    pix.set_rect(pix.irect, (200, 200, 200))
+    page.insert_image(fitz.Rect(0, 0, 600, 800), pixmap=pix)
+    assert _image_coverage(page) >= 0.9

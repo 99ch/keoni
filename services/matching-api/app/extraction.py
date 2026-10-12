@@ -55,6 +55,25 @@ OCR_LANGUAGES = os.getenv("MATCHING_OCR_LANGUAGES", "fra+eng")
 OCR_OEM = int(os.getenv("MATCHING_OCR_OEM", "3"))
 OCR_MAX_PAGES = int(os.getenv("MATCHING_OCR_MAX_PAGES", "20"))
 OCR_PAGE_TIMEOUT_SECONDS = int(os.getenv("MATCHING_OCR_PAGE_TIMEOUT_SECONDS", "25"))
+# Page "incomplète" : une grande image (le corps du CV rendu en image, avec
+# seulement quelques lignes de texte en couche texte) et peu de caractères.
+# Constaté en production le 2026-10-12 : un CV de 928 caractères (état civil
+# seulement) n'avait jamais déclenché l'OCR, la page dépassant largement le
+# seuil de OCR_MIN_TEXT_LENGTH.
+OCR_SPARSE_IMAGE_COVERAGE = float(os.getenv("MATCHING_OCR_SPARSE_IMAGE_COVERAGE", "0.5"))
+OCR_SPARSE_MAX_CHARS = int(os.getenv("MATCHING_OCR_SPARSE_MAX_CHARS", "1500"))
+# Au-delà de ce nombre de caractères, un texte quasi sans mot courant est
+# considéré illisible (voir looks_unreadable).
+_UNREADABLE_MIN_CHARS = 120
+
+# Mots courants (français et anglais) qui reconnaissent un texte lisible : une
+# page de CV normale en contient une proportion élevée, un texte dont la
+# police PDF est mal décodée n'en contient presque aucun.
+_COMMON_WORDS = frozenset(
+    """de du des la le les un une et en au aux pour par sur avec dans que qui est sont ce cette ces son sa ses
+    leur the and of to in for with on at by from is are as an or be this that it je ai suis nous vous il elle
+    ils mon ma mes ou mais plus entre sans chez vers sous ans année années depuis""".split()
+)
 
 
 # Les lignes plus longues que ce seuil sont candidates à la déduplication
@@ -376,6 +395,62 @@ def _line_center_in_bbox(line_bbox: tuple[float, float, float, float], table_bbo
     return table_bbox[0] <= cx <= table_bbox[2] and table_bbox[1] <= cy <= table_bbox[3]
 
 
+def looks_unreadable(text: str) -> bool:
+    """Vrai pour un texte PRÉSENT mais inexploitable : cas typique d'un PDF dont
+    la police n'a pas de table de correspondance Unicode, qui sort des
+    caractères décalés ("DWDDQDO\\VW", "3\\WKRQ64/" pour "Data Analyst",
+    "Python SQL"). La longueur seule ne le détecte pas -- c'est pourquoi l'OCR,
+    déclenché uniquement sur les pages presque vides, passait à côté de ces CV,
+    qui n'avaient alors aucune compétence détectée.
+
+    Critères : assez de caractères, presque aucun mot courant français/anglais,
+    ET soit des mots anormalement longs (les espaces ont disparu), soit des
+    symboles au milieu des mots. Une liste de compétences techniques
+    ("Python, SQL, Docker…") ou un état civil ne répondent à aucun des deux."""
+    t = text.strip()
+    if len(t) < _UNREADABLE_MIN_CHARS:
+        return False
+    words = re.findall(r"[^\W\d_]{2,}", t.lower())
+    if len(words) < 8:
+        return len(t) >= 400  # beaucoup de caractères, presque aucun mot
+    common_share = sum(1 for w in words if w in _COMMON_WORDS) / len(words)
+    long_tokens = sum(1 for w in words if len(w) >= 15) / len(words)
+    odd_symbols = len(re.findall(r"[A-Za-z][\[\\\]«»¬\^{}|~][A-Za-z]", t)) / len(words)
+    return common_share < 0.03 and (long_tokens > 0.15 or odd_symbols > 0.05)
+
+
+def page_ocr_reason(text: str, image_coverage: float) -> str | None:
+    """Pourquoi une page doit passer à l'OCR, ou None si son texte est fiable :
+    "vide" (presque aucun caractère), "illisible" (texte mal décodé) ou
+    "incomplète" (grande image et peu de texte). Fonction pure, testée seule."""
+    stripped = text.strip()
+    if len(stripped) < OCR_MIN_TEXT_LENGTH:
+        return "vide"
+    if looks_unreadable(stripped):
+        return "illisible"
+    if image_coverage >= OCR_SPARSE_IMAGE_COVERAGE and len(stripped) < OCR_SPARSE_MAX_CHARS:
+        return "incomplète"
+    return None
+
+
+def _image_coverage(page) -> float:
+    """Part de la surface de la page couverte par des images (0.0 à 1.0)."""
+    try:
+        rect = page.rect
+        page_area = float(rect.width * rect.height)
+        if page_area <= 0:
+            return 0.0
+        covered = 0.0
+        for info in page.get_image_info():
+            x0, y0, x1, y1 = info.get("bbox", (0, 0, 0, 0))
+            width = max(0.0, min(x1, rect.x1) - max(x0, rect.x0))
+            height = max(0.0, min(y1, rect.y1) - max(y0, rect.y0))
+            covered += width * height
+        return min(1.0, covered / page_area)
+    except Exception:  # noqa: BLE001 -- une page sans info image n'est jamais "incomplète"
+        return 0.0
+
+
 def extract_text_from_pdf(path: Path) -> str:
     """Extrait le texte d'un PDF via PyMuPDF avec ordre conscient des
     colonnes ; repli OCR pour les pages scannées.
@@ -407,7 +482,8 @@ def extract_text_from_pdf(path: Path) -> str:
     try:
         doc = fitz.open(str(path))
         page_texts: list[str] = []
-        weak_pages: list[int] = []  # pages 0-indexées sous le seuil OCR
+        weak_pages: list[int] = []  # pages 0-indexées à passer à l'OCR
+        weak_reasons: dict[int, str] = {}
         for i, page in enumerate(doc):
             raw = page.get_text("dict")
             blocks = [b for b in raw.get("blocks", []) if b.get("type") == 0]
@@ -431,8 +507,10 @@ def extract_text_from_pdf(path: Path) -> str:
             ordered = _order_lines_by_column(lines, raw.get("width") or page.rect.width)
             t = "\n".join(ln["text"] for ln in ordered)
             page_texts.append(t)
-            if len(t.strip()) < OCR_MIN_TEXT_LENGTH:
+            reason = page_ocr_reason(t, _image_coverage(page))
+            if reason:
                 weak_pages.append(i)
+                weak_reasons[i] = reason
         doc.close()
 
         if weak_pages:
@@ -446,15 +524,22 @@ def extract_text_from_pdf(path: Path) -> str:
                 weak_pages = weak_pages[:OCR_MAX_PAGES]
 
             logger.info(
-                "PDF %s: %d page(s) sous le seuil OCR (%d car.), OCR lancé sur ces pages seulement",
+                "PDF %s: %d page(s) à relire par OCR (%s), OCR lancé sur ces pages seulement",
                 path.name,
                 len(weak_pages),
-                OCR_MIN_TEXT_LENGTH,
+                ", ".join(f"p{i + 1}:{weak_reasons[i]}" for i in weak_pages),
             )
             ocr_by_page = _ocr_pdf_pages(path, weak_pages)
             for i in weak_pages:
                 ocr_text = ocr_by_page.get(i, "")
-                if len(ocr_text.strip()) > len(page_texts[i].strip()):
+                if not ocr_text.strip():
+                    continue
+                if weak_reasons[i] == "illisible":
+                    # Le texte d'origine est du bruit : l'OCR lui est préférable
+                    # même s'il est plus court, tant qu'il est lisible.
+                    if not looks_unreadable(ocr_text):
+                        page_texts[i] = ocr_text
+                elif len(ocr_text.strip()) > len(page_texts[i].strip()):
                     page_texts[i] = ocr_text
 
         return clean_text("\n".join(page_texts))
