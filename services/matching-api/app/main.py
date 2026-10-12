@@ -53,6 +53,8 @@ from app.scoring import (
     set_skill_embedding_tuning,
     active_priority_keyword_terms,
     build_skill_weights,
+    group_by_person,
+    person_keys,
     tokenize,
     weights_for_profile,
 )
@@ -399,6 +401,11 @@ class CvPayload(BaseModel):
     # même principe : prepare_cv() évite de relire tout le texte du CV avec
     # find_skills() à chaque scoring (voir resolve_cv_skills).
     cached_skills_canonical: Optional[List[str]] = None
+    # Identité (WordPress) servant à regrouper les candidatures d'une même
+    # personne dans un classement -- voir scoring.group_by_person.
+    candidate_first_name: Optional[str] = None
+    candidate_last_name: Optional[str] = None
+    candidate_phone: Optional[str] = None
     # "title" (correspondance stricte de titre, ex-L1 n8n) ou "similar"
     # (retenu par le canal sémantique/taxonomie uniquement) -- injecté par
     # retrieve() (voir son commentaire), jamais fourni par un appelant.
@@ -1070,6 +1077,9 @@ def resume_to_cv_payload(resume: dict) -> "CvPayload":
     return CvPayload(
         id=int(resume.get("id") or 0),
         candidate_email=resume.get("email") or None,
+        candidate_first_name=resume.get("first_name") or None,
+        candidate_last_name=resume.get("last_name") or None,
+        candidate_phone=resume.get("phone") or None,
         application_title=resume.get("application_title") or resume.get("title") or None,
         cached_extracted_text=resume.get("cached_extracted_text") or None,
         cached_experience_years=resume.get("cached_experience_years"),
@@ -2752,10 +2762,20 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # -- décision explicite 2026-10-02. Email absent/vide : pas de
     # regroupement possible, chaque fiche reste indépendante (clé par
     # cv_id) plutôt que risquer de fusionner des candidats différents.
-    email_by_cv_id = {cv.payload.id: (cv.payload.candidate_email or "").strip().lower() for cv, _ in ranked}
-    best_by_candidate: dict[str, ScoreItem] = {}
+    person_by_cv_id = group_by_person(
+        {
+            cv.payload.id: person_keys(
+                cv.payload.candidate_email,
+                cv.payload.candidate_phone,
+                cv.payload.candidate_first_name,
+                cv.payload.candidate_last_name,
+            )
+            for cv, _ in ranked
+        }
+    )
+    best_by_candidate: dict[int, ScoreItem] = {}
     for item in scored_items:
-        key = email_by_cv_id.get(item.cv_id) or f"cv:{item.cv_id}"
+        key = person_by_cv_id.get(item.cv_id, item.cv_id)
         current = best_by_candidate.get(key)
         if current is None or item.score > current.score:
             best_by_candidate[key] = item

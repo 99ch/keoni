@@ -6,6 +6,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.scoring import (  # noqa: E402
+    group_by_person,
+    normalize_person_name,
+    normalize_phone,
+    person_keys,
     EMPHASIZED_SKILL_WEIGHT,
     WEAK_SKILL_WEIGHT,
     build_skill_weights,
@@ -811,3 +815,56 @@ def test_generic_skills_no_longer_outweigh_the_offer_s_core_skill():
 
     assert specialist_value > generalist_value
 
+
+# ── Doublons de personnes (2026-10-12) ───────────────────────────────────────
+
+
+def test_person_name_ignores_order_accents_and_case():
+    assert normalize_person_name("Abdelghafour", "OUENJLI") == normalize_person_name("Ouenjli", "ABDELGHAFOUR")
+    assert normalize_person_name("Hélène", "Müller") == normalize_person_name("helene", "muller")
+
+
+def test_a_single_word_name_identifies_nobody():
+    assert normalize_person_name("", "Dupont") is None
+    assert normalize_person_name(None, None) is None
+
+
+def test_phone_is_compared_on_its_last_nine_digits():
+    assert normalize_phone("+212 6 12 34 56 78") == normalize_phone("06 12 34 56 78")
+    assert normalize_phone("12 34") is None
+    assert normalize_phone(None) is None
+
+
+def test_person_keys_collects_email_phone_and_name():
+    keys = person_keys("A.B@Ex.com ", "06 12 34 56 78", "Ada", "Lovelace")
+    assert keys == ["e:a.b@ex.com", "p:612345678", "n:ada lovelace"]
+    assert person_keys(None, None, None, None) == []
+
+
+def test_candidacies_sharing_a_name_are_grouped_even_with_different_emails():
+    # Cas réel : trois candidatures d'une même personne, e-mails différents.
+    groups = group_by_person({
+        7: person_keys("a@x.com", None, "Abdelghafour", "Ouenjli"),
+        8: person_keys("b@y.com", None, "Ouenjli", "Abdelghafour"),
+        9: person_keys("c@z.com", None, "OUENJLI", "ABDELGHAFOUR"),
+        10: person_keys("d@w.com", None, "Marie", "Curie"),
+    })
+    assert groups[7] == groups[8] == groups[9] == 7
+    assert groups[10] == 10
+
+
+def test_grouping_chains_through_different_keys():
+    # A et B partagent l'e-mail, B et C le téléphone : une seule personne.
+    groups = group_by_person({
+        1: ["e:a@x.com"],
+        2: ["e:a@x.com", "p:612345678"],
+        3: ["p:612345678"],
+        4: [],
+    })
+    assert groups[1] == groups[2] == groups[3] == 1
+    assert groups[4] == 4
+
+
+def test_two_people_without_any_common_key_stay_separate():
+    groups = group_by_person({1: ["e:a@x.com", "n:ada lovelace"], 2: ["e:b@y.com", "n:grace hopper"]})
+    assert groups == {1: 1, 2: 2}

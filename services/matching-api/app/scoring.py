@@ -53,7 +53,7 @@ import threading
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from app.document_profile import _fold as _document_fold
 from app.taxonomy import find_skills, normalize_skill
@@ -194,6 +194,71 @@ def select_result_indices(total: int, top_n: int) -> list[int]:
     if top_n <= 0:
         return list(range(total))
     return list(range(min(total, top_n)))
+
+
+def normalize_person_name(first: Optional[str], last: Optional[str]) -> Optional[str]:
+    """Clé de nom indépendante de l'ordre prénom / nom et des accents :
+    « OUENJLI Abdelghafour » et « Abdelghafour Ouenjli » donnent la même. Au
+    moins deux mots d'au moins deux lettres, sinon None (un nom d'un seul mot
+    n'identifie personne)."""
+    raw = f"{first or ''} {last or ''}"
+    tokens = sorted(t for t in re.findall(r"[a-z]{2,}", fold_text(raw)) if t)
+    return " ".join(tokens) if len(tokens) >= 2 else None
+
+
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """Les 9 derniers chiffres : « +212 6 12 34 56 78 » et « 06 12 34 56 78 »
+    désignent le même numéro. None s'il y a moins de 8 chiffres."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-9:] if len(digits) >= 8 else None
+
+
+def person_keys(
+    email: Optional[str], phone: Optional[str], first: Optional[str], last: Optional[str]
+) -> list[str]:
+    """Identifiants d'une personne : e-mail, téléphone, nom. Deux candidatures qui
+    partagent l'un d'eux sont la même personne."""
+    keys: list[str] = []
+    normalized_email = (email or "").strip().lower()
+    if normalized_email:
+        keys.append(f"e:{normalized_email}")
+    normalized_phone = normalize_phone(phone)
+    if normalized_phone:
+        keys.append(f"p:{normalized_phone}")
+    name = normalize_person_name(first, last)
+    if name:
+        keys.append(f"n:{name}")
+    return keys
+
+
+def group_by_person(keys_by_id: Mapping[int, Sequence[str]]) -> dict[int, int]:
+    """Regroupe les candidatures d'une même personne : deux identifiants qui
+    partagent au moins une clé (e-mail, téléphone OU nom) sont dans le même
+    groupe, y compris de proche en proche (A et B partagent l'e-mail, B et C le
+    téléphone : A, B et C sont la même personne). Renvoie, pour chaque
+    identifiant, l'identifiant de son groupe (le plus petit du groupe).
+
+    Constaté le 2026-10-12 : une même personne apparaissait trois fois dans un
+    classement (« OUENJLI ABDELGHAFOUR » / « ABDELGHAFOUR OUENJLI »), le
+    dédoublonnage par e-mail seul ne reliant pas ses candidatures."""
+    parent: dict[int, int] = {cv_id: cv_id for cv_id in keys_by_id}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    owner_by_key: dict[str, int] = {}
+    for cv_id in sorted(keys_by_id):
+        for key in keys_by_id[cv_id]:
+            if key in owner_by_key:
+                a, b = find(owner_by_key[key]), find(cv_id)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+            else:
+                owner_by_key[key] = cv_id
+    return {cv_id: find(cv_id) for cv_id in keys_by_id}
 
 
 def resolve_cv_skills(cached: Optional[Sequence[str]], compute: Callable[[], Sequence[str]]) -> set[str]:
