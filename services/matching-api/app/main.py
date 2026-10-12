@@ -48,6 +48,7 @@ from app.scoring import (
     normalize_whitespace,
     resolve_cv_skills,
     select_rerank_shortlist,
+    select_result_indices,
     strip_html,
     set_skill_embedding_tuning,
     split_priority_keyword_terms,
@@ -100,6 +101,14 @@ class Settings:
     # faire sur les ~33 000 CV demandait plusieurs jours par offre, aucune
     # n'aboutissait (constaté en prod, 2026-10-12). 0 = pas de relecture.
     crossencoder_top_k: int = int(os.getenv("MATCHING_CROSSENCODER_TOP_K", "100"))
+    # Nombre de résultats détaillés et renvoyés/écrits dans WordPress par
+    # offre, les meilleurs d'abord (plus tous les candidats du canal "titre",
+    # voir select_result_indices). TOUS les CV sont évalués et classés ; seuls
+    # ceux-là reçoivent le détail (extraits, forces/faiblesses) et sont
+    # envoyés. Sans plafond (2026-10-07 -> 2026-10-12), une offre renvoyait
+    # ~30 000 résultats en une seule requête de 60 s après avoir purgé les
+    # anciens -- ni exploitable à l'écran ni fiable. 0 = aucun plafond.
+    results_top_n: int = int(os.getenv("MATCHING_RESULTS_TOP_N", "300"))
     # Crédit sémantique partiel sur les compétences/mots-clés non matchés
     # littéralement — portage de skill_embedding_* côté AI Real-Time
     # (settings.py). Modèle DÉLIBÉRÉMENT différent de `sentence_model`
@@ -2048,7 +2057,12 @@ def representative_excerpts(text: str, terms: List[str], max_items: int, window:
 
 
 def build_score(
-    job: PreparedJob, cv: PreparedCv, similarity: float, rank: int, rerank_score: Optional[float] = None
+    job: PreparedJob,
+    cv: PreparedCv,
+    similarity: float,
+    rank: int,
+    rerank_score: Optional[float] = None,
+    detailed: bool = True,
 ) -> ScoreItem:
     # Moyenne pondérée renormalisée sur les composantes ayant un vrai signal
     # + plafond de couverture skills/mots-clés + pénalité core-keyword —
@@ -2062,6 +2076,22 @@ def build_score(
         active_weights(job.scoring_profile),
         semantic_skill_credit_fn=semantic_skill_credit,
     )
+
+    if not detailed:
+        # Score seul, sans forces/faiblesses/extraits (le gros du coût par
+        # CV) : suffit à classer tout le vivier ; le détail n'est construit
+        # que pour les résultats finalement gardés (voir _run_score). Seuls
+        # les champs lus par le tri et le dédoublonnage de _run_score sont
+        # renseignés.
+        return ScoreItem(
+            cv_id=cv.payload.id,
+            score=result.score,
+            extra={
+                "vector_similarity": round(float(similarity), 4),
+                "cv_experience_years": cv.experience_years,
+                "retrieval_channel": cv.payload.retrieval_channel,
+            },
+        )
 
     strengths: List[str] = []
     weaknesses: List[str] = []
@@ -2584,8 +2614,9 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
     # le calcul). "Tout CV avec un document réel est évalué, sans
     # exception."
     scored_items: List[ScoreItem] = [
-        build_score(job, cv, sim, rank, None) for rank, (cv, sim) in enumerate(ranked)
+        build_score(job, cv, sim, rank, None, detailed=False) for rank, (cv, sim) in enumerate(ranked)
     ]
+    rerank_scores: dict[int, float] = {}
 
     # Relecture fine (cross-encoder) limitée aux crossencoder_top_k meilleurs
     # sur ce score complet : le cross-encoder ne pèse que 0.10 du score final
@@ -2604,7 +2635,7 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
         )
         for i in shortlist:
             cv, sim = ranked[i]
-            scored_items[i] = build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id))
+            scored_items[i] = build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id), detailed=False)
 
     # Une même personne peut avoir plusieurs fiches de candidature distinctes
     # (même email, intitulés différents à chaque candidature) -- constaté en
@@ -2649,6 +2680,25 @@ def _run_score(payload: ScoreRequest, *, use_cross_encoder: bool = True) -> Scor
             int(item.cv_id),
         )
     )
+
+    # Seuls les meilleurs résultats (plus le canal "titre") reçoivent le
+    # détail et sont renvoyés -- voir Settings.results_top_n. Tous les CV ont
+    # été évalués et classés ci-dessus ; le score détaillé est recalculé à
+    # l'identique (mêmes entrées, y compris le score cross-encoder).
+    kept_positions = select_result_indices(
+        [item.extra.get("retrieval_channel") for item in scored_items], settings.results_top_n
+    )
+    index_by_cv_id = {cv.payload.id: i for i, (cv, _sim) in enumerate(ranked)}
+    detailed_items: List[ScoreItem] = []
+    for position in kept_positions:
+        light = scored_items[position]
+        i = index_by_cv_id[light.cv_id]
+        cv, sim = ranked[i]
+        full = build_score(job, cv, sim, i, rerank_scores.get(cv.payload.id), detailed=True)
+        # Étiquette "titre" éventuellement reportée par le dédoublonnage.
+        full.extra["retrieval_channel"] = light.extra.get("retrieval_channel")
+        detailed_items.append(full)
+    scored_items = detailed_items
 
     for final_rank, item in enumerate(scored_items, start=1):
         item.extra["rank"] = final_rank
