@@ -84,7 +84,7 @@ _TECH_SKILLS: Dict[str, List[str]] = {
     "SSRS": ["ssrs", "sql server reporting services"],
     "PostgreSQL": ["postgresql", "postgres", "psql"],
     "MySQL": ["mysql", "maria db", "mariadb"],
-    "Oracle DB": ["oracle", "oracle database", "oracle db", "pl/sql", "oracledb"],
+    "Oracle DB": ["oracle", "oracle database", "oracle db", "oracledb"],
     "DB2": ["db2", "ibm db2"],
     "Snowflake": ["snowflake"],
     "QlikSense": ["qliksense", "qlik sense", "qlik"],
